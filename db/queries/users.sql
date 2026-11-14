@@ -1,0 +1,17 @@
+-- name: GetUserByID :one
+SELECT * FROM users
+WHERE id = $1 LIMIT 1;
+
+-- name: GetUserByEmail :one
+SELECT * FROM users
+WHERE lower(trim(email)) = lower(trim($1)) LIMIT 1;
+
+-- name: CreateUser :one
+INSERT INTO users (
+    email,
+    password_hash,
+    display_name
+) VALUES (
+    $1, $2, $3
+)
+RETURNING *;
