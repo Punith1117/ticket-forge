@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 
-## 1. Correctness-First Principle
+## Correctness-First Principle
 
 PostgreSQL is the source of truth for inventory, venue scheduling, reservations, bookings, payments, and refunds.
 
@@ -10,45 +10,59 @@ Redis, the message broker, and process memory must not bypass database invariant
 
 Correctness must hold across multiple API instances and worker processes.
 
-## 2. Failure Scenarios
+The system must remain correct when:
+
+- Requests are retried.
+- Multiple customers compete for the same inventory.
+- API instances process requests concurrently.
+- Workers execute the same work more than once.
+- Processes crash during operations.
+- Messages are delivered more than once.
+- External infrastructure becomes temporarily unavailable.
+
+## Failure Scenarios
 
 | Scenario | Risk | Expected Behavior |
 | --- | --- | --- |
 | Two customers request the final ticket | Overselling | Only one allocation succeeds |
-| Same reservation request is retried | Duplicate reservation | Return original operation result |
-| Same idempotency key used with different payload | Ambiguous operation | Reject key misuse |
+| Same reservation request is retried | Duplicate reservation | Return the original operation result |
+| Same idempotency key is used with a different payload | Ambiguous operation | Reject key misuse |
 | API crashes before transaction commit | Partial update | Database rolls back uncommitted transaction |
-| API crashes after commit but before response | Client retries | Idempotency returns committed result |
+| API crashes after commit but before response | Client retries | Idempotency returns the committed result |
 | Confirmation races with expiration | Invalid state transition | Only one transition wins |
 | Reservation cancellation races with expiration | Double inventory release | Only one transition wins |
-| Worker crashes during expiration | Incomplete work | Work can safely resume |
+| Worker crashes during expiration | Incomplete work | Work remains safely retryable |
 | Outbox publisher crashes after broker publish | Duplicate event | Consumer handles duplicate delivery |
 | Broker unavailable | Delayed event publication | Outbox retains unpublished events |
 | Consumer receives duplicate event | Duplicate side effect | Consumer is idempotent |
 | Redis unavailable | Cache/rate-limit degradation | Booking correctness remains intact |
 | PostgreSQL unavailable | Booking unavailable | Fail closed; do not report successful reservation |
 | API instance crashes | Interrupted request | Client retries safely using idempotency |
-| Simulated payment fails | False confirmation | No confirmed booking is created; reservation remains Held if still eligible |
+| Simulated payment fails | False confirmation | No booking is created; reservation remains Held if still eligible |
 | Payment retry occurs after expiry | Invalid confirmation | Reject confirmation |
 | Organizer changes ticket price | Historical price corruption | Existing reservations retain their price snapshots |
 | Two organizers schedule overlapping events at one venue | Double booking of venue | Only one scheduling operation succeeds |
 | Event creation races with another event creation | Venue scheduling race | Database-level protection prevents overlap |
-| Ticket-category capacities exceed venue capacity | Event exceeds physical venue capacity | Reject the capacity configuration; total category capacity must not exceed venue capacity |
-| Concurrent ticket-category capacity changes | Combined category capacity exceeds venue capacity | Database-level transactional protection ensures concurrent changes cannot violate the aggregate capacity invariant |
-| Event cancellation races with reservation confirmation | Booking confirmed for a cancelled event | Confirmation checks event status and reservation state within a transaction; only a valid transition can succeed |
-| Event cancellation races with reservation expiration | Reserved inventory released twice | Reservation state transition and inventory release are atomic; only one operation can release the inventory |
-| Event cancellation races with customer cancellation | Reserved inventory released twice | Only one state transition wins and inventory is released exactly once |
-| Event cancellation while Held reservations exist | Held reservations remain confirmable or inventory remains reserved | Held reservations are invalidated, cannot be confirmed, and their inventory is released exactly once |
+| Event rescheduling races with reservation creation | Event schedule changes after reservations begin | Transactional coordination ensures either rescheduling succeeds before a reservation exists, or the reservation prevents rescheduling |
+| Ticket-category capacities exceed venue capacity | Event exceeds physical venue capacity | Reject the capacity configuration |
+| Concurrent ticket-category capacity changes | Combined category capacity exceeds venue capacity | Transactional coordination ensures the aggregate capacity invariant holds |
+| Venue capacity is reduced below an active event's allocated capacity | Event exceeds physical venue capacity | Reject the venue capacity reduction |
+| Venue is deactivated while events reference it | Existing events become invalid unexpectedly | Existing events remain scheduled; deactivation prevents new event selection |
+| Event cancellation races with reservation creation | Reservation created for cancelled event | Event-level coordination prevents a reservation after cancellation takes effect |
+| Event cancellation races with reservation confirmation | Booking confirmed for a cancelled event | Only a valid transition can succeed |
+| Event cancellation races with reservation expiration | Reserved inventory released twice | State transition and inventory release are atomic |
+| Event cancellation races with customer cancellation | Reserved inventory released twice | Only one state transition wins |
+| Event cancellation while Held reservations exist | Held reservations remain confirmable or inventory remains reserved | Held reservations are invalidated and inventory is released in the cancellation transaction |
 | Event cancellation with multiple confirmed bookings | Some bookings do not receive refund work | Refund work is durably recorded for every confirmed booking |
-| Refund processing succeeds but worker crashes before recording success | Duplicate refund on retry | Refund processing uses an idempotent operation and safely handles retries |
+| Refund processing succeeds but worker crashes before recording success | Duplicate refund on retry | Idempotent refund operation safely handles retries |
 | Refund fails repeatedly | Booking remains unrefunded | Record failure details and keep refund work retryable; event remains Cancelled |
-| Refund completes | Sold inventory is accidentally restored | Refund processing does not modify inventory or reservation state |
-| Organizer cancels an event | Unrefunded bookings | Refund work is durably recorded and retryable |
-| Refund operation fails | Incomplete refund | Record failure and allow safe retry |
-| Event cancellation is retried | Duplicate refunds | Idempotency and uniqueness prevent duplicate refunds |
+| Refund completes | Sold inventory is accidentally restored | Refund processing does not modify inventory |
+| Event cancellation is retried | Duplicate refunds | Idempotency and uniqueness prevent duplicate refund records |
 | Worker crashes during refund processing | Incomplete refund work | Refund remains discoverable and retryable |
+| Booking availability is paused during reservation creation | Reservation created after pause | Transactional coordination ensures a reservation is accepted only if booking availability is open at the relevant validation point |
+| Booking availability is paused while a Held reservation exists | Existing reservation becomes unconfirmable | Existing Held reservation remains eligible for confirmation until its original expiry, if all other conditions hold |
 
-## 3. Concurrency Scenarios to Test
+## Concurrency Scenarios to Test
 
 ### Test 1: Last Tickets
 
@@ -59,6 +73,7 @@ Expected:
 - Exactly 10 ticket units are allocated.
 - No inventory becomes negative.
 - No duplicate allocation occurs.
+- All other requests fail with an appropriate insufficient-inventory response.
 
 ### Test 2: Duplicate Reservation Request
 
@@ -68,8 +83,19 @@ Expected:
 
 - One logical reservation.
 - Every successful retry returns the same operation result.
+- No additional inventory is allocated.
 
-### Test 3: Confirmation vs Expiration
+### Test 3: Idempotency Key Misuse
+
+One customer submits a reservation request using an idempotency key, then reuses that key with a different payload.
+
+Expected:
+
+- The second request is rejected.
+- The original reservation remains unchanged.
+- No additional inventory is allocated.
+
+### Test 4: Confirmation vs Expiration
 
 Confirmation and expiration execute concurrently for one reservation.
 
@@ -78,8 +104,9 @@ Expected:
 - Only one valid transition wins.
 - Inventory accounting remains correct.
 - A reservation that has expired cannot become confirmed.
+- A confirmed reservation cannot subsequently be expired.
 
-### Test 4: Reservation Cancellation vs Expiration
+### Test 5: Reservation Cancellation vs Expiration
 
 A customer cancels a Held reservation while a worker is expiring it.
 
@@ -87,8 +114,9 @@ Expected:
 
 - Only one transition wins.
 - Inventory is released exactly once.
+- The losing operation handles the already-transitioned reservation safely.
 
-### Test 5: Multiple Workers
+### Test 6: Multiple Workers
 
 Multiple workers attempt to process the same expiration workload.
 
@@ -96,8 +124,9 @@ Expected:
 
 - No duplicate inventory release.
 - No lost expiration work.
+- Workers can safely retry unfinished work.
 
-### Test 6: Multiple API Instances
+### Test 7: Multiple API Instances
 
 Multiple API instances compete for the same category inventory.
 
@@ -105,26 +134,28 @@ Expected:
 
 - PostgreSQL invariants hold across all instances.
 - No process-local state is required for correctness.
+- Inventory cannot be oversold.
 
-### Test 7: Venue Scheduling Conflict
+### Test 8: Venue Scheduling Conflict
 
 Two organizers concurrently attempt to create events at the same venue with overlapping intervals.
 
 Expected:
 
 - Only one event creation succeeds.
-- No overlapping non-cancelled events exist for the venue.
+- No overlapping active events exist for the venue.
+- The PostgreSQL exclusion constraint prevents the conflict.
 
-### Test 8: Adjacent Venue Events
+### Test 9: Adjacent Venue Events
 
 One event ends at 15:00 and another starts at 15:00 at the same venue.
 
 Expected:
 
 - Both events can be scheduled.
-- The intervals are treated as non-overlapping.
+- The intervals are treated as non-overlapping because they are half-open: `[start, end)`.
 
-### Test 9: Price Change During Reservations
+### Test 10: Price Change During Reservations
 
 A customer creates a reservation, then the organizer changes the category price.
 
@@ -132,20 +163,22 @@ Expected:
 
 - The existing reservation retains its original price.
 - A new reservation uses the updated price.
+- Existing bookings retain their historical price.
 
-### Test 10: Event Cancellation and Refunds
+### Test 11: Event Cancellation and Refunds
 
 An organizer cancels an event with multiple confirmed bookings.
 
 Expected:
 
-- The event becomes Cancelled.
+- The event becomes `cancelled`.
 - New reservations and confirmations are rejected.
+- Outstanding Held reservations are invalidated and their inventory released in the cancellation transaction.
 - Refund work is created for confirmed bookings.
 - Repeated cancellation requests do not create duplicate refunds.
 - Failed refunds remain retryable.
 
-### Test 11: Venue Physical Capacity
+### Test 12: Venue Physical Capacity
 
 A venue has a physical capacity of 1,000.
 
@@ -156,10 +189,10 @@ Two concurrent requests attempt to increase category capacities by 200 each.
 Expected:
 
 - Only a valid capacity configuration can be committed.
-- The combined category capacity must never exceed 1,000.
+- Combined category capacity must never exceed 1,000.
 - Concurrent updates cannot bypass the aggregate capacity invariant.
 
-### Test 12: Event Cancellation vs Confirmation
+### Test 13: Event Cancellation vs Confirmation
 
 A customer has a Held reservation for an event.
 
@@ -167,12 +200,13 @@ The organizer cancels the event while the customer attempts to confirm the reser
 
 Expected:
 
-- The event becomes Cancelled.
-- No new confirmation succeeds after cancellation.
+- The event becomes `cancelled`.
+- No confirmation succeeds after cancellation has taken effect.
 - The reservation cannot become Confirmed for a cancelled event.
+- If confirmation commits first, the resulting booking is included in the cancellation's refund processing.
 - Inventory accounting remains correct regardless of which transaction executes first.
 
-### Test 13: Event Cancellation vs Reservation Expiration
+### Test 14: Event Cancellation vs Reservation Expiration
 
 An event has several Held reservations.
 
@@ -180,13 +214,13 @@ The organizer cancels the event while an expiration worker processes those reser
 
 Expected:
 
-- Each Held reservation is invalidated or expired through a valid state transition.
+- Each Held reservation is invalidated through a valid state transition.
 - Each reservation releases its inventory exactly once.
 - No inventory becomes negative.
 - No inventory is released twice.
 - Both operations can safely be retried.
 
-### Test 14: Event Cancellation vs Customer Cancellation
+### Test 15: Event Cancellation vs Customer Cancellation
 
 A customer cancels a Held reservation at the same time the organizer cancels the event.
 
@@ -196,19 +230,19 @@ Expected:
 - Inventory is released exactly once.
 - The losing operation handles the already-transitioned reservation safely.
 
-### Test 15: Event Cancellation with Multiple Confirmed Bookings
+### Test 16: Event Cancellation with Multiple Confirmed Bookings
 
 An event has multiple confirmed bookings when the organizer cancels it.
 
 Expected:
 
-- The event becomes Cancelled.
+- The event becomes `cancelled`.
 - Every confirmed booking gets refund work recorded.
-- Repeated cancellation requests do not create duplicate refund work.
+- Repeated cancellation requests do not create duplicate refund records.
 - Refund processing does not alter sold inventory.
 - Refund failures remain retryable.
 
-### Test 16: Refund Worker Crash and Retry
+### Test 17: Refund Worker Crash and Retry
 
 A refund worker processes a refund successfully but crashes before recording the successful result.
 
@@ -216,16 +250,37 @@ The worker later retries the same refund.
 
 Expected:
 
-- The retry does not cause a duplicate refund.
+- The retry does not cause a duplicate successful refund.
 - Refund processing is idempotent.
 - The final refund state accurately reflects the outcome.
-- The event remains Cancelled regardless of refund processing outcome.
+- The event remains `cancelled` regardless of refund processing outcome.
 
-## 4. Event Cancellation: Transactional and Concurrency Guarantees
+### Test 18: Event Rescheduling vs Reservation Creation
+
+An organizer attempts to reschedule an event while a customer attempts to reserve tickets for it.
+
+Expected:
+
+- Both operations coordinate through the event.
+- If reservation creation succeeds first, the event can no longer be rescheduled.
+- If rescheduling succeeds first, the reservation uses the updated event information.
+- No reservation is created against an inconsistent schedule.
+
+### Test 19: Booking Availability vs Reservation Creation
+
+An organizer pauses bookings while customers are attempting to reserve tickets.
+
+Expected:
+
+- A reservation cannot be created if the pause takes effect before its booking-availability validation.
+- A reservation that successfully commits before the pause remains valid.
+- Existing Held reservations remain eligible for confirmation until their original expiry, provided other conditions hold.
+
+## Event Cancellation: Transactional and Concurrency Guarantees
 
 Event cancellation affects event availability, reservations, inventory, and refunds. It must be handled as a coordinated business operation.
 
-### 4.1 Cancellation vs Confirmation
+### Cancellation vs Confirmation
 
 A reservation confirmation must verify:
 
@@ -235,9 +290,14 @@ A reservation confirmation must verify:
 
 These checks must be protected by appropriate transactional concurrency control.
 
-If event cancellation and confirmation execute concurrently, the database must serialize the conflicting operations so that a reservation cannot be confirmed for an event that has already been cancelled.
+If event cancellation and confirmation execute concurrently, the database must serialize the conflicting operations so that:
 
-### 4.2 Cancellation vs Reservation Expiration
+- If confirmation commits first, the booking is created and must be included in event cancellation's refund processing.
+- If cancellation commits first, confirmation must fail.
+
+A reservation cannot be confirmed for an event that has already been cancelled.
+
+### Cancellation vs Reservation Expiration
 
 Event cancellation and the expiration worker may attempt to invalidate the same Held reservation.
 
@@ -249,7 +309,7 @@ The reservation state transition and corresponding inventory release must happen
 
 This guarantees that only one operation releases the reserved quantity.
 
-### 4.3 Cancellation vs Customer Cancellation
+### Cancellation vs Customer Cancellation
 
 Customer cancellation and event cancellation may target the same Held reservation.
 
@@ -257,7 +317,7 @@ Both operations must follow the same state-transition and inventory-accounting r
 
 If one operation has already transitioned the reservation out of Held, the other must not release its inventory again.
 
-### 4.4 Cancellation and Refund Processing
+### Cancellation and Refund Processing
 
 Event cancellation must durably record refund work for every confirmed booking associated with the event.
 
@@ -268,28 +328,52 @@ A refund worker failure must not:
 - Reactivate the event.
 - Change a Confirmed reservation back to Held.
 - Restore sold inventory.
-- Cause duplicate refunds when processing is retried.
+- Cause duplicate refund records.
+- Cause duplicate successful refund execution when processing is retried.
 
 Refund operations must be idempotent and safely retryable.
 
-### 4.5 Transactional and Asynchronous Boundaries
+### Transactional and Asynchronous Boundaries
 
-The event cancellation workflow must guarantee that:
+The event cancellation workflow must guarantee that, within one database transaction:
 
-1. The event is marked Cancelled.
-2. New reservations and confirmations are prevented.
-3. Existing Held reservations are invalidated and their reserved inventory is released exactly once.
-4. Refund work is durably recorded for every confirmed booking.
+1. The event is marked `cancelled`.
+2. New reservations and confirmations are prevented through event-level coordination.
+3. Existing Held reservations are locked and invalidated.
+4. Reserved inventory is released for each invalidated reservation exactly once.
+5. Pending refund records are created for every confirmed booking requiring a refund.
+6. The event cancellation outbox record is created.
 
-The event cancellation and the durable recording of required follow-up work must be coordinated through database transactions and the transactional outbox pattern where appropriate.
+The transaction commits only when all these changes succeed.
 
-Background workers may process reservation invalidation and refunds asynchronously.
+Refund execution happens asynchronously after commit.
 
-Regardless of when workers execute, the event must remain Cancelled immediately after the cancellation transaction commits. Confirmation requests must reject the cancelled event even if some Held reservations have not yet been processed by a worker.
+**Held reservation invalidation is not deferred to a background worker.** Workers may handle other asynchronous follow-up work, but the cancellation transaction itself must invalidate Held reservations and release their inventory.
 
-The exact division between synchronous database operations and asynchronous worker processing will be finalized during application and sequence-diagram design.
+This guarantees that immediately after cancellation commits:
 
-## 5. Observability Signals
+- The event is cancelled.
+- No new reservation can be created.
+- No Held reservation can be confirmed.
+- No reserved inventory remains allocated to invalidated Held reservations.
+- Refund work is durably recorded.
+
+### Refund Execution and Retry
+
+Refund records are persisted before the cancellation transaction commits.
+
+The Refund Worker:
+
+1. Claims pending or retryable refund records.
+2. Processes the refund operation.
+3. Persists the outcome.
+4. Makes failed operations eligible for controlled retry.
+
+The initial implementation uses simulated refunds. The simulation must support deterministic idempotent processing so that a retry cannot produce duplicate successful effects.
+
+For a future real payment provider, external idempotency keys and reconciliation will be required to handle a successful provider-side refund followed by a worker crash before local success is recorded.
+
+## Observability Signals
 
 At minimum, collect:
 
@@ -316,7 +400,7 @@ At minimum, collect:
 
 Avoid logging passwords, authentication tokens, or unnecessary personal information.
 
-## 6. Recovery Expectations
+## Recovery Expectations
 
 - PostgreSQL rolls back uncommitted transactions.
 - Committed outbox records remain available for publication.
@@ -326,14 +410,14 @@ Avoid logging passwords, authentication tokens, or unnecessary personal informat
 - Refund processing can resume without duplicating completed refunds.
 - Graceful shutdown avoids abandoning work unnecessarily.
 - Venue scheduling constraints remain enforced after API restarts and across multiple instances.
+- Inventory accounting remains correct after API and worker restarts.
+- Event cancellation remains effective even when refund processing is unavailable.
 
-## 7. Failure-Test Acceptance
+## Failure-Test Acceptance
 
 A failure test is successful only when business invariants are verified after recovery.
 
-For example:
-
-Killing a worker is not sufficient.
+For example, killing a worker is not sufficient.
 
 We must also verify that after restart:
 
@@ -342,5 +426,9 @@ We must also verify that after restart:
 - No confirmed booking is lost.
 - No duplicate event processing corrupts state.
 - Pending refunds are eventually retried.
-- Completed refunds are not repeated.
-- No overlapping events are created at the same venue.
+- Completed refunds are not executed successfully more than once.
+- No overlapping active events are created at the same venue.
+- Venue capacity is never exceeded by an event's allocated ticket categories.
+- Cancelled events cannot accept new reservations or confirmations.
+- Held reservations invalidated by event cancellation do not retain reserved inventory.
+- Refunded bookings remain historical records and do not restore sold inventory.

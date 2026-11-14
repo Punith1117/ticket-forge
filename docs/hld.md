@@ -2,20 +2,21 @@
 
 **Status:** Accepted
 
-## 1. Architectural Goals
+## Architectural Goals
 
 - Start with a modular monolith.
 - Keep business logic separate from HTTP and infrastructure concerns.
 - Use PostgreSQL as the source of truth.
-- Separate API and worker process entry points when needed.
+- Separate API and worker process entry points.
 - Introduce infrastructure incrementally.
 - Support multiple API instances without depending on in-memory shared state.
-- Enforce inventory correctness and venue scheduling constraints across all API instances.
-- Make asynchronous payment-refund and event-processing workflows recoverable.
+- Enforce inventory correctness, venue scheduling, and venue capacity constraints across all API instances.
+- Make asynchronous workflows recoverable and safe to retry.
+- Keep the initial implementation understandable and avoid premature distributed-system complexity.
 
-## 2. Architecture Style
+## Architecture Style
 
-Initial architecture: Modular Monolith.
+Initial architecture: **Modular Monolith**.
 
 The application uses one Go codebase with cohesive internal modules.
 
@@ -29,11 +30,13 @@ Infrastructure:
 
 - **PostgreSQL:** Authoritative persistent storage.
 - **Redis:** Caching and rate limiting.
-- **Message broker:** Asynchronous event transport.
+- **Message broker:** Asynchronous event transport; implementation choice remains open.
 - **Prometheus:** Metrics collection.
 - **Grafana:** Metrics visualization.
 
-## 3. High-Level Architecture Diagram
+The API and worker are separate process entry points, but they share the same application codebase and domain logic.
+
+## High-Level Architecture Diagram
 
 ```mermaid
 flowchart TB
@@ -80,42 +83,70 @@ flowchart TB
     Worker --> Obs
 ```
 
-The outbox is a table inside PostgreSQL, not a separate infrastructure service.
-
 The diagram represents the target architecture. Some components will be introduced only in later implementation phases.
 
-## 4. Logical Modules
+The outbox is a table inside PostgreSQL, not a separate infrastructure service.
+
+The worker process initially hosts:
+
+- Reservation expiration.
+- Refund processing.
+- Outbox publishing.
+- Other asynchronous consumers introduced later.
+
+The broker is not required for a normal reservation transaction to commit. Business changes and their corresponding outbox records are committed together in PostgreSQL.
+
+## Logical Modules
 
 ### Identity and Access
 
 Responsibilities:
 
 - User registration.
-- Authentication.
-- Organizer profiles.
+- Email verification.
+- Authentication and session management.
+- Organizer profile creation.
 - Authorization.
 - Resource ownership.
 
 Every registered user has customer capabilities. Organizer capabilities are granted through an organizer profile.
 
-Organizer activation is immediate in the initial version.
+The initial authentication model uses email/password authentication and stateful sessions.
+
+Passwords are hashed using Argon2id. Session tokens are generated securely, while only their hashes are persisted.
+
+Email verification is required before users can reserve tickets or activate organizer capabilities.
+
+Organizer activation is immediate after the required verification and profile creation. There is no separate approval workflow in the initial version.
 
 ### Catalog
 
 Responsibilities:
 
 - Platform-managed venue catalog.
-- Event management.
+- Event creation and management.
+- Event rescheduling and cancellation.
 - Ticket category management.
-- Event publication lifecycle.
+- Booking availability controls.
 - Venue scheduling validation.
 - Venue capacity validation.
 
-Organizers can select existing venues but cannot freely create or modify venue records through the application.
+Organizers can select existing active venues but cannot freely create or modify venue records through the application.
 
-Each event belongs to one organizer and references one venue.
+Each event belongs to exactly one organizer and references one venue.
 
-The catalog must prevent overlapping non-cancelled events at the same venue.
+Events are created directly with lifecycle status `active`. There is no Draft or Published state.
+
+Event lifecycle and booking availability are separate:
+
+- Event lifecycle: `active`, `cancelled`.
+- Booking availability: `open`, `paused`.
+
+Event completion is derived from its schedule and is not persisted as a lifecycle state.
+
+The catalog must prevent overlapping active events at the same venue. PostgreSQL exclusion constraints provide authoritative protection against concurrent scheduling conflicts.
+
+The total allocated capacity of an event's ticket categories must not exceed its venue's physical capacity. This aggregate invariant requires transactional coordination.
 
 ### Inventory
 
@@ -129,6 +160,16 @@ Responsibilities:
 
 PostgreSQL is authoritative for inventory.
 
+For each ticket category:
+
+```text
+available = capacity - reserved_quantity - sold_quantity
+```
+
+Inventory transitions must occur atomically with their corresponding reservation or booking state transitions.
+
+Redis must never become the authoritative inventory store.
+
 ### Booking
 
 Responsibilities:
@@ -139,6 +180,14 @@ Responsibilities:
 - Reservation cancellation.
 - Idempotency coordination.
 - Historical price snapshots.
+
+Reservations initially have a two-minute lifetime.
+
+A reservation can produce at most one booking.
+
+Expired and cancelled Held reservations release their reserved inventory exactly once.
+
+Confirmed bookings remain historical records. Individual confirmed-booking cancellation is not supported in the initial version.
 
 ### Payment Simulation
 
@@ -151,14 +200,33 @@ Responsibilities:
 
 Failed payment attempts are retained.
 
+A failed payment does not automatically release inventory. The reservation remains Held if it is still eligible.
+
+The initial implementation uses a deterministic simulator rather than a real payment provider.
+
 ### Refund Processing
 
 Responsibilities:
 
-- Initiating refunds after event cancellation.
+- Creating refund records during event cancellation.
+- Processing pending refunds.
 - Recording simulated refund outcomes.
 - Retrying failed refunds.
-- Preventing duplicate refunds.
+- Preventing duplicate refund operations.
+
+Event cancellation performs its critical database changes synchronously:
+
+- Marks the event as `cancelled`.
+- Invalidates outstanding Held reservations.
+- Releases their reserved inventory.
+- Creates pending refund records for confirmed bookings.
+- Records the cancellation outbox event.
+
+These changes commit atomically.
+
+Actual refund execution is asynchronous. Refund processing failures do not reactivate events or restore sold inventory.
+
+There is at most one refund record per booking. Retries operate on the existing refund record.
 
 ### Asynchronous Processing
 
@@ -167,10 +235,20 @@ Responsibilities:
 - Transactional outbox.
 - Outbox publishing.
 - Reservation expiration.
-- Event consumers.
 - Refund processing.
+- Event consumers.
 - Retry handling.
-- Event cancellation processing.
+- Duplicate message handling.
+
+The transactional outbox ensures that business changes and corresponding event records are committed atomically.
+
+The outbox publisher sends committed records to the message broker.
+
+Delivery is treated as at least once. Consumers must therefore be idempotent.
+
+Workers must safely claim work, revalidate state, and tolerate retries and process crashes.
+
+Reservation expiration and event cancellation coordinate through database transactions. Event cancellation itself does not defer Held reservation invalidation to a background worker.
 
 ### Observability
 
@@ -182,21 +260,51 @@ Responsibilities:
 - Health checks.
 - Operational diagnostics.
 
-## 5. Deployment Evolution
+Prometheus collects metrics from API instances and workers.
+
+Grafana provides dashboards for application behavior and infrastructure health.
+
+Important signals include:
+
+- HTTP request count, latency, and error rates.
+- Reservation attempts and outcomes.
+- Inventory conflicts.
+- Reservation expiration lag.
+- Venue scheduling conflicts.
+- Database connection pool utilization.
+- Worker processing duration.
+- Pending refund count and oldest pending refund age.
+- Outbox backlog and oldest unpublished event age.
+- Broker publishing failures.
+- Consumer retries and dead-letter counts.
+
+Sensitive information such as passwords, session tokens, and unnecessary personal information must not be logged.
+
+## Deployment Evolution
 
 ### Initial Setup
 
-Docker Compose runs PostgreSQL.
+Run PostgreSQL 18 using a local container through Compose.
 
-The Go API can run directly on Fedora using `go run` during early development.
+The Go API can run directly on Fedora during early development.
 
 The initial venue catalog is populated through seed data.
 
+Database schema changes are managed through versioned SQL migrations.
+
+The initial database access approach uses:
+
+- `pgx/v5` and `pgxpool` for PostgreSQL connectivity.
+- `sqlc` for type-safe query code generation.
+- Goose for SQL migrations.
+
 ### Caching Phase
 
-Add Redis to Docker Compose.
+Add Redis to the local container environment.
 
 Use it for selected caching and rate-limiting requirements.
+
+Redis is optional for business correctness. Its unavailability must not allow inventory overselling or violate other PostgreSQL invariants.
 
 ### Messaging Phase
 
@@ -204,11 +312,17 @@ Add a message broker.
 
 Introduce the outbox publisher and worker process.
 
+Use the transactional outbox pattern to reliably publish events resulting from committed database transactions.
+
+The specific broker remains an implementation decision.
+
 ### Observability Phase
 
 Add Prometheus and Grafana.
 
 Instrument the API, database interactions, and workers.
+
+Introduce structured logging and tracing as needed.
 
 ### Multi-Instance Phase
 
@@ -218,49 +332,88 @@ All API instances share PostgreSQL and the required infrastructure.
 
 Correctness must not depend on sticky sessions or process-local memory.
 
-## 6. Important Architectural Rules
+Stateful authentication sessions are persisted in PostgreSQL, allowing requests to be handled by different API instances.
 
-1. PostgreSQL enforces inventory correctness.
-2. PostgreSQL enforces venue scheduling correctness.
-3. Redis is not the authoritative inventory store.
-4. Broker availability must not be required to commit a normal reservation.
-5. Outbox events are committed atomically with their corresponding business changes.
-6. Consumers assume at-least-once delivery.
-7. Workers must be safe to retry.
-8. API shutdown must allow in-flight requests to finish within a configured deadline.
-9. Worker shutdown must stop claiming new work and safely finish or release claimed work.
-10. Event cancellation must be durable even if refund processing is temporarily unavailable.
-11. Refund processing must be idempotent.
-12. Price changes must not modify existing reservation or booking amounts.
+## Important Architectural Rules
 
-## 7. Initial Technology Direction
+1. PostgreSQL is the source of truth for business-critical state.
+2. PostgreSQL enforces venue scheduling correctness through exclusion constraints.
+3. Inventory allocation and release must be transactionally correct.
+4. Aggregate venue-capacity constraints must be protected through transactional coordination.
+5. Redis is not the authoritative inventory store.
+6. Broker availability must not be required to commit a normal reservation.
+7. Outbox events are committed atomically with their corresponding business changes.
+8. Consumers assume at-least-once delivery.
+9. Consumers and workers must be safe to retry.
+10. API shutdown must allow in-flight requests to finish within a configured deadline.
+11. Worker shutdown must stop claiming new work and safely finish or release claimed work.
+12. Event cancellation must be durable even if refund processing is temporarily unavailable.
+13. Event cancellation synchronously invalidates Held reservations and releases their inventory.
+14. Refund processing must be idempotent.
+15. Refund processing must not restore sold inventory.
+16. Price changes must not modify existing reservation or booking amounts.
+17. Authorization must enforce organizer ownership at the resource level.
+18. Multiple API instances and workers must coordinate through shared persistent state, not process-local locks.
 
-| Concern | Technology |
-| --- | --- |
-| Language | Go |
-| API | REST over HTTP |
-| Database | PostgreSQL |
-| Local infrastructure | Docker Compose |
-| Cache and rate limiting | Redis |
-| Messaging | To be selected |
-| Migrations | Versioned SQL migrations |
-| API testing | Bruno and curl |
-| Metrics | Prometheus |
-| Dashboards | Grafana |
+## Initial Technology Direction
+
+| Concern | Technology | Decision |
+| --- | --- | --- |
+| Language | Go | Selected |
+| API | REST over HTTP | Selected |
+| Database | PostgreSQL 18 | Selected |
+| PostgreSQL driver | pgx/v5 and pgxpool | Selected |
+| Query generation | sqlc | Selected |
+| Migrations | Goose | Selected |
+| Local infrastructure | Compose | Selected |
+| Cache and rate limiting | Redis | Selected |
+| Messaging | Message broker | To be selected |
+| Authentication | Email/password and stateful sessions | Selected |
+| Password hashing | Argon2id | Selected |
+| Email delivery | Resend | Selected |
+| API testing | Bruno and curl | Selected |
+| Metrics | Prometheus | Selected |
+| Dashboards | Grafana | Selected |
 | Load testing | To be selected |
 | Reverse proxy | To be selected |
 
-## 8. Decisions Deferred Until Implementation
+## Decisions Deferred Until Implementation
+
+The following decisions remain open and should be made when their corresponding implementation phases approach:
 
 - Go HTTP router.
-- Database access approach.
-- PostgreSQL migration tool.
 - Message broker.
 - Redis client.
-- Authentication strategy.
-- Reverse proxy.
+- Reverse proxy and load balancer.
 - Exact deployment topology.
-- Exact PostgreSQL venue-overlap constraint.
-- Worker claiming and retry strategy for refunds.
+- Load-testing tool.
+- Detailed worker claiming, retry, and backoff policies.
+- Outbox retention and cleanup policy.
+- Consumer deduplication strategy.
+- Detailed database locking strategy for aggregate venue capacity.
+- Detailed database locking and lock-order strategy across reservation, confirmation, cancellation, and expiration operations.
+- Operational procedures for failed refunds and dead-letter messages.
 
-These decisions should be made when their corresponding implementation phases approach and recorded as ADRs when consequential.
+Consequential architectural decisions should be recorded as ADRs.
+
+## Implementation Philosophy
+
+Build the system incrementally.
+
+Start with PostgreSQL-backed business functionality and establish correctness before introducing additional infrastructure.
+
+A sensible implementation progression is:
+
+1. Database schema, migrations, and query generation.
+2. Identity and access.
+3. Venue and event management.
+4. Ticket categories and inventory.
+5. Reservations and booking confirmation.
+6. Simulated payments and refunds.
+7. Transactional outbox and background workers.
+8. Redis integration where justified.
+9. Message broker integration.
+10. Observability and load testing.
+11. Multiple API instances behind a reverse proxy.
+
+Each phase should preserve the established business invariants rather than introducing infrastructure merely for architectural appearance.

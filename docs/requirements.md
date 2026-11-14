@@ -4,31 +4,32 @@
 **Project:** TicketForge  
 **Scope:** Initial release
 
-## 1. Purpose
+## Purpose
 
 TicketForge is a REST-based ticket booking engine built with Go.
 
 Its primary engineering challenge is allocating limited ticket inventory correctly when many customers attempt to reserve tickets concurrently.
 
-It also manages events at shared physical venues, preventing conflicting event schedules.
+It also manages events at shared physical venues, preventing conflicting event schedules and ensuring that allocated ticket capacity never exceeds the venue's physical capacity.
 
 The initial release supports general-admission tickets. Assigned seating will be introduced as a later enhancement.
 
-## 2. Project Goals
+## Project Goals
 
 - Provide event and ticket-category management for organizers.
 - Maintain a platform-managed venue catalog.
 - Allow customers to discover events and reserve tickets.
 - Support temporary reservations followed by simulated payment and booking confirmation.
 - Prevent overselling under concurrent requests.
-- Prevent overlapping events at the same venue.
+- Prevent overlapping active events at the same venue.
+- Ensure event ticket allocation does not exceed venue capacity.
 - Make client retries safe through idempotency.
 - Support reliable asynchronous processing.
 - Recover from worker and infrastructure failures.
 - Support event cancellation and simulated refunds.
 - Measure system behavior through testing, monitoring, and profiling.
 
-## 3. Scope
+## Scope
 
 ### Included
 
@@ -37,6 +38,8 @@ The initial release supports general-admission tickets. Assigned seating will be
 - Immediate organizer activation.
 - Platform-managed venue catalog.
 - Event management and venue scheduling.
+- Event rescheduling subject to reservation-history restrictions.
+- Separate event lifecycle and booking availability states.
 - General-admission ticket categories.
 - Ticket inventory management.
 - Event discovery.
@@ -73,17 +76,18 @@ The initial release supports general-admission tickets. Assigned seating will be
 - Individual cancellation of confirmed bookings.
 - Automatic scheduled early-bird pricing.
 
-## 4. Actors and Business Roles
+## Actors and Business Roles
 
 ### Customer
 
 A registered user who can:
 
-- Browse published events.
-- View ticket availability.
+- Browse active events.
+- View event details and ticket availability.
 - Reserve tickets.
 - Attempt payment for eligible reservations.
 - Retry failed payments while the reservation remains eligible.
+- Cancel eligible Held reservations.
 - View their own reservations.
 - View their own booking history.
 
@@ -102,9 +106,11 @@ An organizer can:
 - Create and manage events.
 - Select venues from the platform-managed catalog.
 - Define ticket categories.
-- Configure prices and capacities.
+- Configure ticket prices and capacities.
 - Change ticket prices.
-- Publish and cancel events.
+- Pause or resume booking availability.
+- Reschedule eligible events.
+- Cancel their own events.
 - View relevant booking information for their events.
 
 An organizer can also act as a customer.
@@ -133,7 +139,7 @@ This responsibility does not require an application-level Admin role. Operationa
 
 Platform-operated processes also maintain the initial venue catalog.
 
-## 5. Functional Requirements
+## Functional Requirements
 
 ### FR-01: Identity and Access Management
 
@@ -148,41 +154,135 @@ Platform-operated processes also maintain the initial venue catalog.
 ### FR-02: Venue Catalog
 
 - The platform maintains a catalog of venues.
-- Venue records contain relevant location, timezone, and capacity information.
-- Organizers can browse and select existing venues.
+- Venue records contain:
+  - Name.
+  - Structured address fields, including street address, city, state, postal code, and country code.
+  - IANA timezone.
+  - Physical capacity.
+  - Active/inactive state.
+- Country codes use ISO 3166-1 alpha-2.
+- Organizers can browse and select existing active venues.
 - Organizers cannot create or modify venue records through the initial application.
 - Venue catalog entries are maintained through controlled operational processes.
 - A venue can host multiple events, provided their scheduled intervals do not overlap.
+- Only active venues can be selected when creating or rescheduling events.
+- Deactivating a venue does not automatically cancel its existing events.
+- Existing active events continue to occupy the venue's schedule even if the venue is deactivated.
+- Referenced venues cannot be physically deleted.
+- The combined capacity of an event's ticket categories must not exceed the venue's physical capacity.
+- A venue capacity reduction must be rejected if it would cause any active event's allocated ticket capacity to exceed the proposed venue capacity.
+- Increasing venue capacity does not automatically increase existing event ticket-category capacities.
 
-### FR-03: Event Management
+### FR-03: Event Management and Scheduling
 
-- Organizers can create events at existing venues.
+- Organizers can create events at existing active venues.
 - Each event belongs to exactly one organizer.
 - Events contain title, description, venue, schedule, and booking-window information.
-- Events must have valid start and end times.
-- Non-cancelled events at the same venue must not have overlapping scheduled intervals.
-- Organizers can publish, update, and cancel their events.
-- Customers can discover published events.
+- Events are created directly with the `active` lifecycle status.
+- The initial release does not have persisted Draft, Published, or Completed event states.
+- An active event can exist without ticket categories and does not necessarily have to be bookable.
+- Organizers can update their own events, subject to the applicable business rules.
+- Customers can discover active events.
 - Cancelling an event prevents further reservations and confirmations.
+
+#### Event lifecycle
+
+The persisted event lifecycle has two states:
+
+- `active`
+- `cancelled`
+
+Cancellation is terminal. A cancelled event cannot be reactivated.
+
+Event completion is derived from time: an active event is considered completed when the current time reaches or passes `ends_at`. Completion is not a persisted event status.
+
+#### Event scheduling constraints
+
+- Event start must be at least 15 minutes in the future.
+- Event start must be no more than one calendar year in the future.
+- Minimum event duration is 15 minutes.
+- Maximum event duration is 7 days.
+- The same scheduling boundaries apply when rescheduling.
+- One calendar year is calculated using calendar arithmetic, not a fixed 365-day duration.
+- Time-dependent scheduling rules are validated by the application at write time.
+
+The scheduled interval is half-open:
+
+`[starts_at, ends_at)`
+
+The end is exclusive. Two events at the same venue may be scheduled consecutively without a gap.
+
+Only active events occupy a venue's schedule.
+
+Non-cancelled events at the same venue must not have overlapping scheduled intervals. This guarantee must be enforced with database-level concurrency control rather than relying solely on an application availability check.
+
+#### Event rescheduling
+
+- Organizers can reschedule their own events only if the event has never had any reservation or booking associated with it.
+- Any reservation record blocks rescheduling, regardless of whether it is currently Held, expired, or cancelled.
+- Any confirmed booking also blocks rescheduling, including bookings that have subsequently been refunded.
+- Reservation records must be retained as historical records and must not be physically deleted when they expire or are cancelled.
+- The destination venue must be active.
+- The new schedule must satisfy all event scheduling constraints.
+- The new schedule must not conflict with another active event at the destination venue.
+- Rescheduling must be transactional and coordinated with reservation creation to prevent a reservation from being created concurrently with a reschedule.
+- Cancelled events cannot be rescheduled. An organizer who wants to run the event again must create a new event.
 
 ### FR-04: Ticket Category Management
 
 - Organizers can create ticket categories for an event.
-- Each category has a name, price, currency, and capacity.
-- Categories can be activated or deactivated according to event lifecycle rules.
+- An event can have zero or more ticket categories.
+- Each category has a name, current price, currency, and allocated capacity.
+- Categories can be activated or deactivated according to event lifecycle and booking rules.
 - The system tracks inventory independently for each category.
 - Organizers can change ticket category prices, including after sales begin.
 - A price change applies only to reservations created after the change.
 - Existing reservations and bookings retain their historical price information.
+- The sum of an event's ticket-category capacities must not exceed its venue's physical capacity.
+- A category's allocated capacity cannot be reduced below its committed inventory: reserved quantity plus sold quantity.
+- Capacity changes must be coordinated transactionally with reservation and booking operations.
 
-### FR-05: Event Discovery
+### FR-05: Booking Availability Controls
 
-- Customers can browse published events.
+Booking availability is separate from the event lifecycle.
+
+The persisted booking availability state has two values:
+
+- `open`
+- `paused`
+
+The default state for a new event is `open`.
+
+Organizers can pause or resume booking availability for their own active events.
+
+When booking availability is paused:
+
+- New reservations are rejected.
+- Existing Held reservations remain eligible for payment until their original expiry, provided all other confirmation conditions are satisfied.
+- Pausing does not extend reservation expiry.
+- Reservation expiration continues normally.
+
+Effective booking availability is derived from:
+
+1. Event cancellation.
+2. Booking availability state.
+3. Sales start time.
+4. Sales end time.
+5. Remaining inventory.
+
+An event being `open` does not guarantee that reservations can be created. For example, sales may not have started, may have ended, or inventory may be exhausted.
+
+Event cancellation overrides booking availability and prevents new reservations and confirmations.
+
+### FR-06: Event Discovery
+
+- Customers can browse active events.
 - Customers can view event details.
-- Customers can view ticket categories and availability.
-- Customers can identify sold-out or unavailable categories.
+- Customers can view ticket categories and their availability.
+- Customers can identify sold-out, paused, not-yet-open, and ended booking availability.
+- Customers must not be able to reserve tickets for cancelled events.
 
-### FR-06: Reservation Management
+### FR-07: Reservation Management
 
 - Customers can reserve a positive quantity of tickets.
 - Reservations temporarily hold inventory.
@@ -192,8 +292,12 @@ Platform-operated processes also maintain the initial venue catalog.
 - Customers can cancel eligible Held reservations.
 - Payment retries do not extend reservation expiry.
 - Expired reservations cannot be confirmed.
+- New reservations are rejected when the event is cancelled or booking availability does not permit new reservations.
+- New reservations are rejected when the requested inventory is unavailable.
+- Reservation creation must be safe under concurrent requests.
+- Reservation records are retained after expiration or cancellation for auditing and historical business-rule enforcement.
 
-### FR-07: Payment and Booking
+### FR-08: Payment and Booking
 
 - Customers can attempt to confirm eligible reservations through simulated payment.
 - Simulated payment can produce success or failure.
@@ -203,46 +307,63 @@ Platform-operated processes also maintain the initial venue catalog.
 - Customers can retry payment until the reservation expires or otherwise becomes ineligible.
 - Successful payment results in a confirmed booking.
 - Failed payment must not create a confirmed booking.
+- A reservation can produce at most one booking.
+- Confirmation must be coordinated with reservation expiry, event cancellation, and reservation state transitions.
 - Customers can view their booking history.
 - Individual confirmed bookings cannot be cancelled in the initial release.
 
-### FR-08: Event Cancellation and Refunds
+### FR-09: Event Cancellation and Refunds
 
-- Organizers can cancel their own events.
+- Organizers can cancel their own active events.
+- Event cancellation is terminal.
 - Cancelling an event prevents new reservations and confirmations.
-- The system initiates a refund for each confirmed booking associated with the cancelled event.
+- Existing Held reservations are invalidated as part of the cancellation transaction.
+- Reserved inventory for invalidated Held reservations is released exactly once.
+- Held reservation invalidation must be coordinated with reservation expiration and payment confirmation to prevent duplicate inventory release or late confirmation.
+- The system initiates a full refund for each confirmed booking associated with the cancelled event.
 - Refund processing is simulated in the initial version.
-- Refund outcomes are persisted.
+- Refund records and outcomes are persisted independently of booking records.
 - Failed refunds can be retried safely.
 - Repeated event cancellation requests must not create duplicate refunds.
+- Refund retries operate on the existing refund record.
 - Event cancellation remains effective even if refund processing fails temporarily.
+- Refund processing is asynchronous and must not require the cancellation transaction to wait for the refund operation to finish.
+- Refunding a booking does not restore sold inventory.
+- A booking remains a historical record after it has been refunded.
 
-### FR-09: Inventory Correctness
+### FR-10: Inventory Correctness
 
 - The system must prevent overselling.
 - Concurrent reservation attempts must be handled safely.
 - Inventory must be released after reservation expiration.
 - Inventory must be released after eligible Held reservation cancellation.
+- Event cancellation must invalidate outstanding Held reservations and release their reserved inventory.
 - Confirmation moves inventory from reserved to sold.
 - Inventory must not be released more than once for the same reservation transition.
+- Reserved quantity plus sold quantity must never exceed ticket-category capacity.
+- The combined allocated capacity of all categories must never exceed the venue's physical capacity.
+- Refund processing must not modify inventory.
 
-### FR-10: Idempotency
+### FR-11: Idempotency
 
 - Reservation and confirmation endpoints support idempotency keys.
 - Repeating an operation with the same key must not create duplicate logical operations.
 - Reusing a key with a different request payload must be rejected.
 - Event cancellation and refund initiation must also be safe against duplicate processing.
+- Refund retries must not create duplicate refund records or duplicate refund operations.
 
-### FR-11: Asynchronous Processing
+### FR-12: Asynchronous Processing
 
 - Background workers process reservation expiration.
 - Business events are recorded for reliable publication.
-- Event cancellation can trigger asynchronous refund processing.
+- Event cancellation durably records the work required for asynchronous refund processing.
+- Event cancellation and Held reservation invalidation must be committed consistently.
 - Failed asynchronous operations can be retried.
 - Repeatedly failing messages can be isolated.
 - Consumers safely handle duplicate message delivery.
+- Worker restarts must not cause duplicate inventory release, booking confirmation, or refunds.
 
-### FR-12: Operations and Observability
+### FR-13: Operations and Observability
 
 - The API exposes health endpoints.
 - The system provides structured logs.
@@ -250,59 +371,73 @@ Platform-operated processes also maintain the initial venue catalog.
 - The system exposes relevant metrics.
 - Operators can inspect failed asynchronous work through controlled operational mechanisms.
 
-## 6. Non-Functional Requirements
+## Non-Functional Requirements
 
 These are initial engineering targets. They will be refined using measurements.
 
 | ID | Attribute | Requirement |
 | --- | --- | --- |
 | NFR-01 | Correctness | Never oversell inventory |
-| NFR-02 | Scheduling | Never allow overlapping non-cancelled events at one venue |
-| NFR-03 | Consistency | PostgreSQL is the source of truth |
-| NFR-04 | Idempotency | Repeated requests produce one logical operation |
-| NFR-05 | Performance | Initial target: p95 below 500 ms under a defined baseline load |
-| NFR-06 | Concurrency | Demonstrate correctness under hundreds of concurrent attempts |
-| NFR-07 | Reliability | Recover safely from worker restarts |
-| NFR-08 | Scalability | Support multiple API instances |
-| NFR-09 | Security | Authentication, authorization, validation, secure password storage |
-| NFR-10 | Maintainability | Clear separation of business and infrastructure concerns |
-| NFR-11 | Observability | Logs, metrics, request IDs, and traces where appropriate |
-| NFR-12 | Portability | Reproducible local environment using Docker Compose |
-| NFR-13 | Testability | Unit, integration, API, concurrency, failure, and load tests |
+| NFR-02 | Scheduling | Never allow overlapping active events at one venue |
+| NFR-03 | Capacity | Never allocate more tickets than the venue's physical capacity |
+| NFR-04 | Consistency | PostgreSQL is the source of truth |
+| NFR-05 | Idempotency | Repeated requests produce one logical operation |
+| NFR-06 | Performance | Initial target: p95 below 500 ms under a defined baseline load |
+| NFR-07 | Concurrency | Demonstrate correctness under hundreds of concurrent attempts |
+| NFR-08 | Reliability | Recover safely from worker restarts |
+| NFR-09 | Scalability | Support multiple API instances |
+| NFR-10 | Security | Authentication, authorization, validation, secure password storage |
+| NFR-11 | Maintainability | Clear separation of business and infrastructure concerns |
+| NFR-12 | Observability | Logs, metrics, request IDs, and traces where appropriate |
+| NFR-13 | Portability | Reproducible local environment using Docker Compose |
+| NFR-14 | Testability | Unit, integration, API, concurrency, failure, and load tests |
 
 The latency target excludes simulated payment delays and must always be reported with the test environment and load profile.
 
-## 7. Business Invariants
+## Business Invariants
 
 These are fundamental correctness guarantees.
 
 1. Available inventory must never become negative.
 2. Reserved quantity plus sold quantity must never exceed category capacity.
-3. A reservation cannot be confirmed after it expires.
-4. Inventory must be released exactly once when a Held reservation expires or is cancelled.
-5. A confirmed booking must not be duplicated by retries.
-6. Failed simulated payments must not create confirmed bookings.
-7. Customers cannot access another customer's private booking data.
-8. Organizers cannot manage another organizer's events.
-9. An event must reference an existing platform-managed venue.
-10. Non-cancelled events at the same venue must not have overlapping time intervals.
-11. A cancelled event cannot accept new reservations or confirmations.
-12. Existing reservation and booking prices must not change when an organizer edits current ticket prices.
-13. Event cancellation must initiate refunds for confirmed bookings.
-14. A failed refund must not reactivate a cancelled event.
-15. Business changes requiring event publication must remain publishable after process failure.
-16. Redis and broker failures must not bypass PostgreSQL inventory or venue scheduling guarantees.
-17. The sum of ticket-category capacities for an event must not exceed the venue's physical capacity.
+3. The sum of ticket-category capacities for an event must never exceed the venue's physical capacity.
+4. A reservation cannot be confirmed after it expires.
+5. Inventory must be released exactly once when a Held reservation expires or is cancelled.
+6. A confirmed booking must not be duplicated by retries.
+7. Failed simulated payments must not create confirmed bookings.
+8. Customers cannot access another customer's private booking data.
+9. Organizers cannot manage another organizer's events.
+10. An event must reference an existing platform-managed venue.
+11. Only active venues can be selected for new events or event rescheduling.
+12. Active events at the same venue must not have overlapping time intervals.
+13. A cancelled event cannot accept new reservations or confirmations.
+14. Event cancellation invalidates outstanding Held reservations and releases their inventory exactly once.
+15. Existing reservation and booking prices must not change when an organizer edits current ticket prices.
+16. Event cancellation must initiate full refunds for confirmed bookings.
+17. A failed refund must not reactivate a cancelled event.
+18. Refund processing must not automatically restore sold inventory.
+19. Business changes requiring asynchronous publication must remain publishable after process failure.
+20. Redis and broker failures must not bypass PostgreSQL inventory or venue scheduling guarantees.
+21. An event cannot be rescheduled if any reservation or booking record has ever existed for it.
+22. Reservation and booking records must be retained to preserve historical evidence and support auditing.
+23. Pausing booking availability prevents new reservations but does not invalidate otherwise eligible Held reservations.
+24. Payment retries must not extend reservation expiry.
 
-## 8. Initial Assumptions
+## Initial Assumptions
 
 - Every user can act as a customer.
 - A user may additionally have an organizer profile.
 - Organizer activation is immediate.
 - Each event has exactly one organizer.
 - Venues are platform-managed catalog entries.
-- Organizers select existing venues.
+- Organizers select existing active venues.
 - A venue can host multiple events at different, non-overlapping times.
+- Only active events occupy venue schedules.
+- Event creation immediately produces an active event.
+- Event completion is derived from time rather than persisted as a status.
+- Event cancellation is terminal.
+- Booking availability is independent of event lifecycle.
+- An active event may exist without ticket categories.
 - General admission is the only supported ticket allocation model initially.
 - Currency is INR only in the initial release.
 - Monetary values are stored as integer minor units.
@@ -310,18 +445,37 @@ These are fundamental correctness guarantees.
 - Failed payment attempts leave eligible reservations Held.
 - Payment retries do not extend reservation expiry.
 - Historical reservation and booking prices must not change when organizers edit current ticket prices.
+- Reservation records are retained after expiration or cancellation.
+- An event can be rescheduled only if it has never had a reservation or booking.
 - Individual confirmed-booking cancellation is unsupported.
-- Event cancellation initiates simulated refunds for confirmed bookings.
+- Event cancellation initiates simulated full refunds for confirmed bookings.
+- Refunds do not restore sold inventory.
 - Event times are stored as timezone-aware instants.
+- Venue timezones use IANA timezone identifiers.
 
-## 9. Phase 0 Acceptance Criteria
+## Phase 0 Acceptance Criteria
 
 - Actors and permissions are documented.
 - Core domain concepts are identified.
-- Venue ownership and scheduling rules are documented.
+- Venue ownership, lifecycle, capacity, and scheduling rules are documented.
+- Event lifecycle and booking availability are documented separately.
+- Event creation, rescheduling, and cancellation rules are documented.
 - High-level architecture is documented.
 - Initial relational model is reviewed.
 - Reservation, booking, payment, and refund lifecycles are defined.
 - Critical workflows are documented.
 - Concurrency and failure scenarios are identified.
 - Architectural decisions are recorded.
+
+## Assigned Seating Extension
+
+Assigned seating is intentionally excluded.
+
+A later design may introduce:
+
+- Seat maps.
+- Seats.
+- Seat-level allocation.
+- Seat-level reservation holds.
+
+We should not add these requirements or tables before their requirements are established.

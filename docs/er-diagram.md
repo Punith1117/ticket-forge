@@ -3,7 +3,7 @@
 **Status:** Accepted  
 **Scope:** General-admission ticketing
 
-## 1. ER Diagram
+## ER Diagram
 
 ```mermaid
 erDiagram
@@ -20,17 +20,20 @@ erDiagram
         uuid id PK
         uuid user_id FK,UK
         text display_name
-        text status
         timestamptz created_at
     }
 
     venues {
         uuid id PK
         text name
-        text address
+        text street_address
         text city
+        text state
+        text postal_code
+        char country_code
         text timezone
         integer capacity
+        boolean is_active
         timestamptz created_at
         timestamptz updated_at
     }
@@ -42,6 +45,7 @@ erDiagram
         text title
         text description
         text status
+        text booking_status
         timestamptz starts_at
         timestamptz ends_at
         timestamptz sales_start_at
@@ -111,7 +115,7 @@ erDiagram
 
     refunds {
         uuid id PK
-        uuid booking_id FK
+        uuid booking_id FK,UK
         bigint amount_minor
         char currency
         text status
@@ -146,18 +150,18 @@ erDiagram
     users ||--o| organizer_profiles : may_have
     organizer_profiles ||--o{ events : organizes
     venues ||--o{ events : hosts
-    events ||--|{ ticket_categories : offers
+    events ||--o{ ticket_categories : offers
     ticket_categories ||--|| inventory : tracks
     users ||--o{ reservations : places
     ticket_categories ||--o{ reservations : allocates
     reservations ||--o{ payment_attempts : has
     reservations ||--o| bookings : confirms_into
     users ||--o{ bookings : owns
-    bookings ||--o{ refunds : has
+    bookings ||--o| refunds : has
     users ||--o{ idempotency_records : creates
 ```
 
-## 2. Modeling Notes
+## Modeling Notes
 
 ### Users and Organizer Profiles
 
@@ -181,6 +185,22 @@ Organizers select an existing venue when creating an event. The event references
 
 The initial catalog can be populated using seed data and maintained through controlled operational scripts.
 
+A venue stores:
+
+- Its name.
+- Structured address fields: `street_address`, `city`, `state`, `postal_code`, and `country_code`.
+- Its IANA timezone, such as `Asia/Kolkata`.
+- Its physical capacity.
+- Its active/inactive state through `is_active`.
+
+The `country_code` uses ISO 3166-1 alpha-2.
+
+Only active venues can be selected when creating or rescheduling an event.
+
+Deactivating a venue does not automatically cancel its existing events. Those events continue to occupy the venue's schedule.
+
+Referenced venues cannot be physically deleted. The database must prevent deletion while events reference the venue.
+
 A venue stores its physical capacity. This represents the maximum number of people the physical location can accommodate.
 
 For every event:
@@ -202,11 +222,35 @@ The configuration is valid because 900 does not exceed the venue's physical capa
 
 This is an aggregate invariant across multiple ticket-category rows. A simple SQL `CHECK` constraint cannot enforce it. The implementation must enforce it transactionally, with an appropriate database-level concurrency strategy.
 
+A venue capacity reduction must be rejected if it would make the allocated capacity of any active event exceed the proposed venue capacity.
+
+Increasing venue capacity does not automatically increase any event's ticket-category capacities.
+
 ### Events and Scheduling
 
 Each event references exactly one organizer profile and one venue.
 
 An event must reference an existing platform-managed venue.
+
+The persisted event lifecycle has two states:
+
+- `active`
+- `cancelled`
+
+Cancellation is terminal. A cancelled event cannot be reactivated. If an organizer wants to run the event again, they must create a new event.
+
+Event completion is derived from time: an active event is considered completed when the current time reaches or passes `ends_at`. Completion is not a persisted event status.
+
+An event has a separate booking availability state:
+
+- `open`
+- `paused`
+
+This state is independent of the event lifecycle. Pausing booking availability prevents new reservations but does not itself cancel the event.
+
+Effective booking availability is derived from the event lifecycle, booking availability state, sales window, and remaining inventory.
+
+An event may exist without any ticket categories. An active event is not necessarily bookable.
 
 The event's scheduled interval is:
 
@@ -214,21 +258,55 @@ The event's scheduled interval is:
 
 The end is exclusive. Therefore, an event ending at 15:00 and another starting at 15:00 do not overlap.
 
-Only non-cancelled events participate in venue conflict checks.
+Only active events participate in venue conflict checks.
 
-Two events at the same venue must not have overlapping scheduled intervals.
+Two active events at the same venue must not have overlapping scheduled intervals.
+
+The scheduling rules are:
+
+- Minimum event duration: 15 minutes.
+- Maximum event duration: 7 days.
+- Event start must be at least 15 minutes in the future.
+- Event start must be no more than one calendar year in the future.
+- The same scheduling boundaries apply when rescheduling.
+
+The one-calendar-year boundary uses calendar arithmetic rather than a fixed number of days.
+
+Time-dependent scheduling rules are validated by the application at write time.
 
 The application must not rely solely on a separate availability query followed by an insert. Concurrent event creation must be protected by database-level concurrency control.
 
-PostgreSQL range types and exclusion constraints are a possible implementation. The exact schema and constraint will be finalized during SQL design.
+PostgreSQL range types and exclusion constraints are the intended implementation approach. The exact schema and constraint will be finalized during SQL design. The constraint should use half-open intervals and apply only to active events.
 
 A cancelled event no longer occupies its venue schedule.
+
+#### Event rescheduling
+
+An event may be rescheduled only if it has never had any reservation or booking associated with it.
+
+This means:
+
+- No Held reservations.
+- No expired reservations.
+- No cancelled reservations.
+- No confirmed bookings.
+- No refunded bookings.
+
+Reservation records must be retained as historical records rather than physically deleted when they expire or are cancelled. This allows the system to determine whether an event has ever had a reservation without introducing a separate historical marker.
+
+Rescheduling must be performed transactionally and coordinated with reservation creation and payment confirmation so that a reservation cannot be created concurrently while the event is being rescheduled.
+
+The destination venue must be active and the new schedule must satisfy all scheduling constraints and venue-overlap rules.
+
+A cancelled event is never rescheduled. An organizer who wants to run it again must create a new event.
 
 ### Ticket Categories
 
 Each ticket category belongs to exactly one event.
 
-A category has a current price, currency, and capacity.
+An event may have zero or more ticket categories.
+
+A category has a current price, currency, allocated capacity, and active state.
 
 Organizers may change the current price, including after sales begin.
 
@@ -238,11 +316,19 @@ Existing reservations retain their original price snapshots. Existing bookings r
 
 The sum of an event's ticket-category capacities must not exceed the physical capacity of its venue.
 
+A ticket-category capacity reduction must not reduce capacity below its committed inventory: reserved quantity plus sold quantity.
+
+Capacity changes must be coordinated transactionally with reservation and booking operations.
+
 ### Inventory
+
+Each ticket category has exactly one inventory record.
 
 The available quantity is derived:
 
 `available = capacity - reserved_quantity - sold_quantity`
+
+Capacity is stored on `ticket_categories`. The inventory table tracks reserved and sold quantities; it must not duplicate category capacity.
 
 We should avoid storing redundant availability values unless later measurements justify it.
 
@@ -294,6 +380,8 @@ The reservation state transition and inventory release must be protected by tran
 
 A `cancellation_reason` can distinguish customer cancellation from event cancellation. The exact reservation state names and transition rules are defined in `state-machines.md`.
 
+Reservation records are retained after expiration or cancellation. They provide an audit trail and preserve the historical evidence needed by rules such as event rescheduling eligibility.
+
 An index should support finding expired reservations efficiently, for example:
 
 `(status, expires_at)`
@@ -343,9 +431,13 @@ Refund processing is separate from inventory accounting:
 - A failed refund does not reactivate a cancelled event.
 - Retrying a refund must not create a duplicate refund operation.
 
-The initial policy is a full refund for event cancellation. The implementation must prevent duplicate full refunds for the same booking and cancellation operation.
+The initial policy is a full refund for event cancellation.
 
-The exact refund uniqueness constraint and retry strategy will be finalized during SQL and application design.
+The initial release supports one refund record per booking. A unique constraint on `refunds.booking_id` prevents duplicate refund records for the same booking.
+
+Refund retries operate on the existing refund record rather than creating another one. The refund operation must also be idempotent at the simulated payment-provider boundary.
+
+Refund processing is asynchronous. Event cancellation must durably record the work required to process refunds without waiting for the external refund operation to finish.
 
 ### Idempotency Records
 
@@ -368,8 +460,9 @@ The outbox is important for event cancellation and refund processing. The event 
 For example, the application may publish events representing:
 
 - Event cancellation.
-- Held reservation invalidation.
 - Refund requests for confirmed bookings.
+
+Held reservation invalidation and inventory release are performed as part of the event cancellation transaction. They are not deferred to an independent background operation.
 
 The exact event types and payloads will be finalized during the asynchronous processing design.
 
@@ -402,39 +495,53 @@ Store the venue's IANA timezone separately for event presentation and local sche
 
 Reservation expiry should be evaluated using authoritative server/database time.
 
-## 3. Important Database Invariants
+### Persistence Conventions
+
+- Use PostgreSQL 18's `uuidv7()` as the default UUID generator.
+- Use `timestamptz` for persisted instants.
+- Use lowercase values for persisted status and state strings.
+- Use foreign keys to enforce entity relationships.
+- Use restrictive deletion behavior for historical records that must be retained.
+
+## Important Database Invariants
 
 The following rules must be enforced by the database, transactional application logic, or both:
 
 1. Every event references an existing venue.
 2. Non-cancelled events at the same venue cannot have overlapping time intervals.
-3. The sum of ticket-category capacities for an event cannot exceed the venue's physical capacity.
-4. Available inventory must never become negative.
-5. Reserved quantity plus sold quantity must never exceed category capacity.
-6. A reservation cannot be confirmed after expiry.
-7. A reservation can produce at most one confirmed booking.
-8. Inventory must be released exactly once when a Held reservation expires or is cancelled.
-9. Event cancellation prevents new reservations and confirmations.
-10. Event cancellation invalidates existing Held reservations and releases their inventory exactly once.
-11. Event cancellation initiates refunds for confirmed bookings.
-12. Refund processing is separate from inventory accounting.
-13. A refund does not automatically restore sold inventory.
-14. Refund retries must not create duplicate refunds for the same cancellation operation.
+3. Only active venues can be selected for new events or event rescheduling.
+4. The sum of ticket-category capacities for an event cannot exceed the venue's physical capacity.
+5. Available inventory must never become negative.
+6. Reserved quantity plus sold quantity must never exceed category capacity.
+7. A reservation cannot be confirmed after expiry.
+8. A reservation can produce at most one confirmed booking.
+9. Inventory must be released exactly once when a Held reservation expires or is cancelled.
+10. Event cancellation prevents new reservations and confirmations.
+11. Event cancellation invalidates existing Held reservations and releases their inventory exactly once.
+12. Event cancellation initiates full refunds for confirmed bookings.
+13. Refund processing is separate from inventory accounting.
+14. A refund does not automatically restore sold inventory.
+15. Refund retries must not create duplicate refunds for the same booking.
+16. An event cannot be rescheduled if any reservation or booking record has ever existed for it.
+17. Reservation and booking history must be retained to enforce historical business rules and support auditing.
 
-## 4. Questions Before SQL Schema Approval
+Some of these are row-level constraints; others span multiple rows or entities and therefore require transactional logic and appropriate locking.
+
+## Questions Before SQL Schema Approval
+
+The following decisions remain open:
 
 1. Are ticket quantities limited per customer?
 2. How long should idempotency records be retained?
 3. Should failed idempotency responses be stored?
-4. What is the retention policy for expired reservations?
-5. What is the retention policy for published outbox events?
-6. Should a buffer be required between events at the same venue?
-7. Should venue capacity reductions be allowed after events have been created?
-8. Should ticket-category capacity reductions be allowed after reservations or sales have begun?
-9. What exact uniqueness and retry policy should apply to refunds?
-10. Should event cancellation process Held reservation invalidation synchronously or through a background worker?
+4. What is the retention policy for published outbox events?
+5. Should a buffer be required between events at the same venue?
+6. Should ticket-category capacity reductions be allowed after reservations or sales have begun, provided committed inventory is not exceeded?
+7. Should organizer verification be introduced in a future release?
+8. What is the canonical IANA timezone validation strategy?
+9. What inspection and manual retry workflow should be provided for failed refunds?
 
-## 5. Assigned Seating Extension
+## Assigned Seating Extension
 
 Assigned seating is intentionally excluded.
 
