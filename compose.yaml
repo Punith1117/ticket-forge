@@ -24,5 +24,21 @@ services:
       retries: 10
       start_period: 10s
 
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: ticketforge-mailpit
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+
+    environment:
+      MP_DATABASE: /data/mailpit.db
+
+    volumes:
+      - ticketforge_mailpit_data:/data:Z
+
 volumes:
   ticketforge_postgres_data:
+  ticketforge_mailpit_data:
