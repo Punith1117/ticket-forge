@@ -11,16 +11,21 @@ import (
 )
 
 type Querier interface {
+	ClaimOutboxEvents(ctx context.Context, arg ClaimOutboxEventsParams) ([]OutboxEvent, error)
+	CompleteOutboxEvent(ctx context.Context, arg CompleteOutboxEventParams) (int64, error)
 	CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	CreateVenue(ctx context.Context, arg CreateVenueParams) (Venue, error)
+	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) (int64, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 	GetVenueByID(ctx context.Context, id pgtype.UUID) (Venue, error)
 	GetVenueBySlug(ctx context.Context, slug string) (Venue, error)
+	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (OutboxEvent, error)
 	ListActiveVenues(ctx context.Context) ([]Venue, error)
 	ListEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error)
+	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)
 }
 
 var _ Querier = (*Queries)(nil)
