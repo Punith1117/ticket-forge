@@ -1,0 +1,26 @@
+package auth
+
+import "errors"
+
+var (
+	// ErrInvalidEmail indicates that the email address fails formatting/syntax rules.
+	ErrInvalidEmail = errors.New("invalid email address format")
+
+	// ErrCooldownActive indicates that a registration challenge was requested too recently for this email.
+	ErrCooldownActive = errors.New("please wait at least 60 seconds before requesting another verification email")
+
+	// ErrInvalidToken indicates that no active challenge matches the provided token hash.
+	ErrInvalidToken = errors.New("invalid verification token")
+
+	// ErrTokenExpired indicates that the verification challenge has passed its 24-hour expiration.
+	ErrTokenExpired = errors.New("verification token has expired")
+
+	// ErrTokenAlreadyConsumed indicates that the verification challenge was already used to create an account.
+	ErrTokenAlreadyConsumed = errors.New("verification token has already been used")
+
+	// ErrInvalidPassword indicates that the password does not satisfy length requirements.
+	ErrInvalidPassword = errors.New("password must be between 12 and 128 characters")
+
+	// ErrEmailAlreadyRegistered indicates that an account with this normalized email address already exists.
+	ErrEmailAlreadyRegistered = errors.New("an account with this email address already exists")
+)
