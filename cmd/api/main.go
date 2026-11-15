@@ -5,10 +5,12 @@ import (
 	"log"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
 )
 
 func main() {
+	config.Load()
 	log.Println("TicketForge API starting...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

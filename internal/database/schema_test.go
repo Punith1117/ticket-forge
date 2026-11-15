@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
 	"github.com/Punith1117/ticket-forge/internal/database/sqlc"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -16,17 +17,27 @@ import (
 
 func setupTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+
+	config.Load("../../.env")
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	cfg := database.ConfigFromEnv()
+
+	testDB := os.Getenv("TEST_POSTGRES_DB")
+	if testDB == "" {
+		t.Fatal("TEST_POSTGRES_DB must be set")
+	}
+	cfg.Database = testDB
+
 	pool, err := database.NewPool(ctx, cfg)
 	if err != nil {
 		t.Fatalf("failed to connect to test db: %v", err)
 	}
 
 	// Clean transient test data
-	_, _ = pool.Exec(ctx, `
+	_, err = pool.Exec(ctx, `
 		DELETE FROM refunds;
 		DELETE FROM bookings;
 		DELETE FROM payment_attempts;
@@ -37,6 +48,10 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 		DELETE FROM organizer_profiles;
 		DELETE FROM users;
 	`)
+	if err != nil {
+		pool.Close()
+		t.Fatalf("failed to clean test database: %v", err)
+	}
 
 	return pool
 }

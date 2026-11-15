@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/joho/godotenv"
 )
 
 // Config holds PostgreSQL connection pool configuration.
@@ -29,9 +28,6 @@ type Config struct {
 // ConfigFromEnv reads database configuration from environment variables,
 // falling back to defaults appropriate for local development.
 func ConfigFromEnv() Config {
-	// Attempt to load .env file if present, ignoring error if it does not exist
-	_ = godotenv.Load()
-
 	cfg := Config{
 		Host:            getEnv("POSTGRES_HOST", "localhost"),
 		Port:            getEnv("POSTGRES_PORT", "5433"),
