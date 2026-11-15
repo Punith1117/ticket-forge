@@ -15,7 +15,7 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	CreateVenue(ctx context.Context, arg CreateVenueParams) (Venue, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
-	GetUserByEmail(ctx context.Context, btrim string) (User, error)
+	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 	GetVenueByID(ctx context.Context, id pgtype.UUID) (Venue, error)
 	GetVenueBySlug(ctx context.Context, slug string) (Venue, error)

@@ -17,9 +17,9 @@ INSERT INTO users (
     password_hash,
     display_name
 ) VALUES (
-    $1, $2, $3
+    lower(trim($1::text)), $2, $3
 )
-RETURNING id, email, password_hash, display_name, email_verified, email_verified_at, created_at, updated_at
+RETURNING id, email, password_hash, display_name, email_verified_at, created_at, updated_at
 `
 
 type CreateUserParams struct {
@@ -36,7 +36,6 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.Email,
 		&i.PasswordHash,
 		&i.DisplayName,
-		&i.EmailVerified,
 		&i.EmailVerifiedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -45,19 +44,18 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, display_name, email_verified, email_verified_at, created_at, updated_at FROM users
-WHERE lower(trim(email)) = lower(trim($1)) LIMIT 1
+SELECT id, email, password_hash, display_name, email_verified_at, created_at, updated_at FROM users
+WHERE email = lower(trim($1::text)) LIMIT 1
 `
 
-func (q *Queries) GetUserByEmail(ctx context.Context, btrim string) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByEmail, btrim)
+func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByEmail, email)
 	var i User
 	err := row.Scan(
 		&i.ID,
 		&i.Email,
 		&i.PasswordHash,
 		&i.DisplayName,
-		&i.EmailVerified,
 		&i.EmailVerifiedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -66,7 +64,7 @@ func (q *Queries) GetUserByEmail(ctx context.Context, btrim string) (User, error
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, display_name, email_verified, email_verified_at, created_at, updated_at FROM users
+SELECT id, email, password_hash, display_name, email_verified_at, created_at, updated_at FROM users
 WHERE id = $1 LIMIT 1
 `
 
@@ -78,7 +76,6 @@ func (q *Queries) GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 		&i.Email,
 		&i.PasswordHash,
 		&i.DisplayName,
-		&i.EmailVerified,
 		&i.EmailVerifiedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,

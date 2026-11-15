@@ -4,7 +4,7 @@ WHERE id = $1 LIMIT 1;
 
 -- name: GetUserByEmail :one
 SELECT * FROM users
-WHERE lower(trim(email)) = lower(trim($1)) LIMIT 1;
+WHERE email = lower(trim(@email::text)) LIMIT 1;
 
 -- name: CreateUser :one
 INSERT INTO users (
@@ -12,6 +12,6 @@ INSERT INTO users (
     password_hash,
     display_name
 ) VALUES (
-    $1, $2, $3
+    lower(trim(@email::text)), @password_hash, @display_name
 )
 RETURNING *;

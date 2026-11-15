@@ -21,15 +21,6 @@ type Booking struct {
 	CreatedAt       pgtype.Timestamptz `db:"created_at" json:"created_at"`
 }
 
-type EmailVerificationToken struct {
-	ID        pgtype.UUID        `db:"id" json:"id"`
-	UserID    pgtype.UUID        `db:"user_id" json:"user_id"`
-	TokenHash string             `db:"token_hash" json:"token_hash"`
-	ExpiresAt pgtype.Timestamptz `db:"expires_at" json:"expires_at"`
-	UsedAt    pgtype.Timestamptz `db:"used_at" json:"used_at"`
-	CreatedAt pgtype.Timestamptz `db:"created_at" json:"created_at"`
-}
-
 type Event struct {
 	ID                 pgtype.UUID                      `db:"id" json:"id"`
 	OrganizerProfileID pgtype.UUID                      `db:"organizer_profile_id" json:"organizer_profile_id"`
@@ -76,14 +67,23 @@ type OrganizerProfile struct {
 }
 
 type OutboxEvent struct {
-	ID            pgtype.UUID        `db:"id" json:"id"`
-	AggregateType string             `db:"aggregate_type" json:"aggregate_type"`
-	AggregateID   pgtype.UUID        `db:"aggregate_id" json:"aggregate_id"`
-	EventType     string             `db:"event_type" json:"event_type"`
-	Payload       []byte             `db:"payload" json:"payload"`
-	OccurredAt    pgtype.Timestamptz `db:"occurred_at" json:"occurred_at"`
-	PublishedAt   pgtype.Timestamptz `db:"published_at" json:"published_at"`
-	Attempts      int32              `db:"attempts" json:"attempts"`
+	ID                pgtype.UUID        `db:"id" json:"id"`
+	AggregateType     string             `db:"aggregate_type" json:"aggregate_type"`
+	AggregateID       pgtype.UUID        `db:"aggregate_id" json:"aggregate_id"`
+	EventType         string             `db:"event_type" json:"event_type"`
+	Payload           []byte             `db:"payload" json:"payload"`
+	OccurredAt        pgtype.Timestamptz `db:"occurred_at" json:"occurred_at"`
+	PublishedAt       pgtype.Timestamptz `db:"published_at" json:"published_at"`
+	Attempts          int32              `db:"attempts" json:"attempts"`
+	Status            string             `db:"status" json:"status"`
+	NextAttemptAt     pgtype.Timestamptz `db:"next_attempt_at" json:"next_attempt_at"`
+	ClaimToken        pgtype.UUID        `db:"claim_token" json:"claim_token"`
+	ClaimedAt         pgtype.Timestamptz `db:"claimed_at" json:"claimed_at"`
+	ClaimExpiresAt    pgtype.Timestamptz `db:"claim_expires_at" json:"claim_expires_at"`
+	LastAttemptAt     pgtype.Timestamptz `db:"last_attempt_at" json:"last_attempt_at"`
+	ProcessedAt       pgtype.Timestamptz `db:"processed_at" json:"processed_at"`
+	LastError         pgtype.Text        `db:"last_error" json:"last_error"`
+	ProviderMessageID pgtype.Text        `db:"provider_message_id" json:"provider_message_id"`
 }
 
 type PasswordResetToken struct {
@@ -116,6 +116,15 @@ type Refund struct {
 	FailureReason pgtype.Text        `db:"failure_reason" json:"failure_reason"`
 	CreatedAt     pgtype.Timestamptz `db:"created_at" json:"created_at"`
 	CompletedAt   pgtype.Timestamptz `db:"completed_at" json:"completed_at"`
+}
+
+type RegistrationVerificationChallenge struct {
+	ID         pgtype.UUID        `db:"id" json:"id"`
+	Email      string             `db:"email" json:"email"`
+	TokenHash  string             `db:"token_hash" json:"token_hash"`
+	ExpiresAt  pgtype.Timestamptz `db:"expires_at" json:"expires_at"`
+	ConsumedAt pgtype.Timestamptz `db:"consumed_at" json:"consumed_at"`
+	CreatedAt  pgtype.Timestamptz `db:"created_at" json:"created_at"`
 }
 
 type Reservation struct {
@@ -160,7 +169,6 @@ type User struct {
 	Email           string             `db:"email" json:"email"`
 	PasswordHash    string             `db:"password_hash" json:"password_hash"`
 	DisplayName     string             `db:"display_name" json:"display_name"`
-	EmailVerified   bool               `db:"email_verified" json:"email_verified"`
 	EmailVerifiedAt pgtype.Timestamptz `db:"email_verified_at" json:"email_verified_at"`
 	CreatedAt       pgtype.Timestamptz `db:"created_at" json:"created_at"`
 	UpdatedAt       pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
