@@ -107,6 +107,13 @@ type PaymentAttempt struct {
 	CompletedAt       pgtype.Timestamptz `db:"completed_at" json:"completed_at"`
 }
 
+type RateLimitBucket struct {
+	Key          string             `db:"key" json:"key"`
+	Tokens       int64              `db:"tokens" json:"tokens"`
+	LastRefillAt pgtype.Timestamptz `db:"last_refill_at" json:"last_refill_at"`
+	UpdatedAt    pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
+}
+
 type Refund struct {
 	ID            pgtype.UUID        `db:"id" json:"id"`
 	BookingID     pgtype.UUID        `db:"booking_id" json:"booking_id"`
