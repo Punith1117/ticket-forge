@@ -34,7 +34,7 @@ func newTestEncrypter(t *testing.T) *security.TokenEncrypter {
 }
 
 func TestHandler_HandleRegister_InvalidJSON(t *testing.T) {
-	handler := auth.NewHandler(nil, nil)
+	handler := auth.NewHandler(nil, nil, false)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewBufferString("{invalid-json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -56,7 +56,7 @@ func TestHandler_HandleRegister_InvalidJSON(t *testing.T) {
 }
 
 func TestHandler_HandleRegister_UnknownFieldsDisallowed(t *testing.T) {
-	handler := auth.NewHandler(nil, nil)
+	handler := auth.NewHandler(nil, nil, false)
 
 	body := `{"email":"test@example.com","unknown_field":"malicious"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/register", bytes.NewBufferString(body))
@@ -71,7 +71,7 @@ func TestHandler_HandleRegister_UnknownFieldsDisallowed(t *testing.T) {
 }
 
 func TestHandler_HandleRegister_BodySizeLimit(t *testing.T) {
-	handler := auth.NewHandler(nil, nil)
+	handler := auth.NewHandler(nil, nil, false)
 
 	hugeEmail := strings.Repeat("a", 70*1024) + "@example.com"
 	body, _ := json.Marshal(auth.RegisterRequest{Email: hugeEmail})
@@ -88,7 +88,7 @@ func TestHandler_HandleRegister_BodySizeLimit(t *testing.T) {
 func TestHandler_HandleRegisterComplete_InvalidPassword(t *testing.T) {
 	// A dummy service instance is fine since password validation happens before DB lookup
 	service := &auth.Service{}
-	handler := auth.NewHandler(service, nil)
+	handler := auth.NewHandler(service, nil, false)
 
 	body, _ := json.Marshal(auth.RegisterCompleteRequest{
 		Token:    "some-token",
@@ -113,7 +113,7 @@ func TestHandler_HandleRegisterComplete_InvalidPassword(t *testing.T) {
 
 func TestHandler_HandleRegisterComplete_EmptyToken(t *testing.T) {
 	service := &auth.Service{}
-	handler := auth.NewHandler(service, nil)
+	handler := auth.NewHandler(service, nil, false)
 
 	body, _ := json.Marshal(auth.RegisterCompleteRequest{
 		Token:    "   ",

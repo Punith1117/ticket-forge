@@ -60,7 +60,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	authHandler := auth.NewHandler(authService, logger)
+	authHandler := auth.NewHandler(authService, logger, os.Getenv("SECURE_COOKIES") == "true")
 
 	mux := http.NewServeMux()
 	authHandler.RegisterRoutes(mux)

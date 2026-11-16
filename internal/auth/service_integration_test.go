@@ -525,7 +525,7 @@ func TestHTTP_FullRegistrationWorkflow(t *testing.T) {
 	}
 	defer pool.Close()
 
-	handler := auth.NewHandler(service, nil)
+	handler := auth.NewHandler(service, nil, false)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	ts := httptest.NewServer(mux)

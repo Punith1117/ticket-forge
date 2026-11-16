@@ -25,7 +25,30 @@ const (
 
 	// DefaultTokenExpiry is the lifetime of a registration verification token.
 	DefaultTokenExpiry = 24 * time.Hour
+
+	// SessionIdleTimeout is the idle session timeout per ADR-012.
+	SessionIdleTimeout = 30 * time.Minute
+
+	// SessionAbsoluteLifetime is the absolute session lifetime per ADR-012.
+	SessionAbsoluteLifetime = 7 * 24 * time.Hour
+
+	// SessionCookieName is the name of the HTTP cookie used to transport the session token.
+	SessionCookieName = "session_token"
 )
+
+// dummyPasswordHash is a valid Argon2id hash pre-computed at startup for timing mitigation
+// on unknown-email login attempts. It prevents obvious timing differences between
+// "user not found" and "wrong password" paths.
+var dummyPasswordHash string
+
+func init() {
+	h, err := security.HashPassword("dummy-password-for-timing-protection-12345!")
+	if err != nil {
+		// This should never fail; panic at startup is acceptable.
+		panic("auth: failed to initialize dummy password hash: " + err.Error())
+	}
+	dummyPasswordHash = h
+}
 
 // Service provides user registration business operations.
 type Service struct {
@@ -294,4 +317,78 @@ func uuidString(u pgtype.UUID) string {
 		return ""
 	}
 	return id.String()
+}
+
+// Login authenticates a user with email and password, creates a session, and returns
+// the raw session token and session info. The caller is responsible for issuing the token
+// to the client only after this method returns successfully.
+//
+// Generic ErrInvalidCredentials is returned for all authentication failures to avoid
+// leaking whether the email exists, the password is wrong, or the account is unverified.
+func (s *Service) Login(ctx context.Context, email, password string) (rawToken string, info SessionInfo, err error) {
+	normalizedEmail, err := NormalizeEmail(email)
+	if err != nil {
+		return "", SessionInfo{}, ErrInvalidCredentials
+	}
+
+	if password == "" {
+		return "", SessionInfo{}, ErrInvalidCredentials
+	}
+
+	// Look up user by normalized email.
+	user, err := s.queries.GetUserByEmail(ctx, normalizedEmail)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// User not found: run dummy Argon2id verification to mitigate timing differences.
+			_, _ = security.VerifyPassword(password, dummyPasswordHash)
+			return "", SessionInfo{}, ErrInvalidCredentials
+		}
+		// Genuine DB error — do NOT convert to ErrInvalidCredentials.
+		return "", SessionInfo{}, fmt.Errorf("auth: failed to look up user: %w", err)
+	}
+
+	// Verify password using existing Argon2id implementation.
+	match, err := security.VerifyPassword(password, user.PasswordHash)
+	if err != nil {
+		// Hash verification error (malformed hash, incompatible algo).
+		// Log this but return generic credentials error to client.
+		return "", SessionInfo{}, fmt.Errorf("auth: password verification error: %w", err)
+	}
+	if !match {
+		return "", SessionInfo{}, ErrInvalidCredentials
+	}
+
+	// Explicitly verify the account is verified (email_verified_at must be set).
+	// All registered accounts have this set, but we check explicitly per security spec.
+	if !user.EmailVerifiedAt.Valid {
+		return "", SessionInfo{}, ErrInvalidCredentials
+	}
+
+	// Generate session token.
+	rawToken, err = security.GenerateToken()
+	if err != nil {
+		return "", SessionInfo{}, ErrTokenGenerationFailed
+	}
+
+	tokenHash := security.HashToken(rawToken)
+	now := time.Now().UTC()
+	idleExpiresAt := now.Add(SessionIdleTimeout)
+	absoluteExpiresAt := now.Add(SessionAbsoluteLifetime)
+
+	// Persist session. Only issue the token if persistence succeeds.
+	session, err := s.queries.CreateSession(ctx, sqlc.CreateSessionParams{
+		UserID:            user.ID,
+		TokenHash:         tokenHash,
+		IdleExpiresAt:     pgtype.Timestamptz{Time: idleExpiresAt, Valid: true},
+		AbsoluteExpiresAt: pgtype.Timestamptz{Time: absoluteExpiresAt, Valid: true},
+	})
+	if err != nil {
+		return "", SessionInfo{}, fmt.Errorf("auth: failed to persist session: %w", err)
+	}
+
+	return rawToken, SessionInfo{
+		SessionID:         uuidString(session.ID),
+		UserID:            uuidString(user.ID),
+		AbsoluteExpiresAt: absoluteExpiresAt,
+	}, nil
 }

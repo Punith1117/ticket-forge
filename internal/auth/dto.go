@@ -32,3 +32,21 @@ type RegisterCompleteResponse struct {
 	Message string       `json:"message"`
 	User    UserResponse `json:"user"`
 }
+
+// LoginRequest holds the payload for user login.
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// LoginResponse represents the response after a successful login.
+type LoginResponse struct {
+	Message string `json:"message"`
+}
+
+// SessionInfo holds details of a created session (for internal use and testing).
+type SessionInfo struct {
+	SessionID         string
+	UserID            string
+	AbsoluteExpiresAt time.Time
+}

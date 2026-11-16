@@ -23,4 +23,10 @@ var (
 
 	// ErrEmailAlreadyRegistered indicates that an account with this normalized email address already exists.
 	ErrEmailAlreadyRegistered = errors.New("an account with this email address already exists")
+
+	// ErrInvalidCredentials is the generic error for failed authentication (email not found, wrong password, or unverified account).
+	ErrInvalidCredentials = errors.New("invalid email or password")
+
+	// ErrTokenGenerationFailed indicates session token generation failed.
+	ErrTokenGenerationFailed = errors.New("failed to generate session token")
 )

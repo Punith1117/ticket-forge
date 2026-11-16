@@ -26,3 +26,22 @@ UPDATE registration_verification_challenges
 SET consumed_at = now()
 WHERE id = @id
   AND consumed_at IS NULL;
+
+-- name: CreateSession :one
+INSERT INTO sessions (
+    user_id,
+    token_hash,
+    idle_expires_at,
+    absolute_expires_at
+) VALUES (
+    @user_id,
+    @token_hash,
+    @idle_expires_at,
+    @absolute_expires_at
+)
+RETURNING *;
+
+-- name: GetSessionByTokenHash :one
+SELECT * FROM sessions
+WHERE token_hash = @token_hash
+LIMIT 1;

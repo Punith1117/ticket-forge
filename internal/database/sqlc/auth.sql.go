@@ -59,6 +59,48 @@ func (q *Queries) CreateRegistrationChallenge(ctx context.Context, arg CreateReg
 	return i, err
 }
 
+const createSession = `-- name: CreateSession :one
+INSERT INTO sessions (
+    user_id,
+    token_hash,
+    idle_expires_at,
+    absolute_expires_at
+) VALUES (
+    $1,
+    $2,
+    $3,
+    $4
+)
+RETURNING id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at
+`
+
+type CreateSessionParams struct {
+	UserID            pgtype.UUID        `db:"user_id" json:"user_id"`
+	TokenHash         string             `db:"token_hash" json:"token_hash"`
+	IdleExpiresAt     pgtype.Timestamptz `db:"idle_expires_at" json:"idle_expires_at"`
+	AbsoluteExpiresAt pgtype.Timestamptz `db:"absolute_expires_at" json:"absolute_expires_at"`
+}
+
+func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error) {
+	row := q.db.QueryRow(ctx, createSession,
+		arg.UserID,
+		arg.TokenHash,
+		arg.IdleExpiresAt,
+		arg.AbsoluteExpiresAt,
+	)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.IdleExpiresAt,
+		&i.AbsoluteExpiresAt,
+		&i.LastActivityAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getLatestRegistrationChallengeByEmail = `-- name: GetLatestRegistrationChallengeByEmail :one
 SELECT id, email, token_hash, expires_at, consumed_at, created_at FROM registration_verification_challenges
 WHERE email = lower(trim($1::text))
@@ -95,6 +137,27 @@ func (q *Queries) GetRegistrationChallengeForUpdate(ctx context.Context, tokenHa
 		&i.TokenHash,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
+SELECT id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at FROM sessions
+WHERE token_hash = $1
+LIMIT 1
+`
+
+func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error) {
+	row := q.db.QueryRow(ctx, getSessionByTokenHash, tokenHash)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.IdleExpiresAt,
+		&i.AbsoluteExpiresAt,
+		&i.LastActivityAt,
 		&i.CreatedAt,
 	)
 	return i, err
