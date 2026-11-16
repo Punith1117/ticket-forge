@@ -29,4 +29,11 @@ var (
 
 	// ErrTokenGenerationFailed indicates session token generation failed.
 	ErrTokenGenerationFailed = errors.New("failed to generate session token")
+
+	// ErrSessionNotFound indicates that no matching active session was found for the provided token.
+	// Returned for unknown, revoked, idle-expired, and absolute-expired sessions.
+	ErrSessionNotFound = errors.New("session not found or expired")
+
+	// ErrLogoutFailed indicates that session revocation did not affect any rows.
+	ErrLogoutFailed = errors.New("failed to revoke session")
 )

@@ -71,7 +71,7 @@ INSERT INTO sessions (
     $3,
     $4
 )
-RETURNING id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at
+RETURNING id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at, revoked_at
 `
 
 type CreateSessionParams struct {
@@ -97,6 +97,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.AbsoluteExpiresAt,
 		&i.LastActivityAt,
 		&i.CreatedAt,
+		&i.RevokedAt,
 	)
 	return i, err
 }
@@ -143,7 +144,7 @@ func (q *Queries) GetRegistrationChallengeForUpdate(ctx context.Context, tokenHa
 }
 
 const getSessionByTokenHash = `-- name: GetSessionByTokenHash :one
-SELECT id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at FROM sessions
+SELECT id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at, revoked_at FROM sessions
 WHERE token_hash = $1
 LIMIT 1
 `
@@ -159,6 +160,55 @@ func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash string) (
 		&i.AbsoluteExpiresAt,
 		&i.LastActivityAt,
 		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
+const revokeSessionByID = `-- name: RevokeSessionByID :execrows
+UPDATE sessions
+SET revoked_at = now()
+WHERE id         = $1
+  AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeSessionByID(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeSessionByID, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const validateAndRefreshSession = `-- name: ValidateAndRefreshSession :one
+UPDATE sessions
+SET
+    idle_expires_at  = LEAST(now() + $1::interval, absolute_expires_at),
+    last_activity_at = now()
+WHERE token_hash          = $2
+  AND revoked_at          IS NULL
+  AND idle_expires_at     > now()
+  AND absolute_expires_at > now()
+RETURNING id, user_id, token_hash, idle_expires_at, absolute_expires_at, last_activity_at, created_at, revoked_at
+`
+
+type ValidateAndRefreshSessionParams struct {
+	IdleTimeout pgtype.Interval `db:"idle_timeout" json:"idle_timeout"`
+	TokenHash   string          `db:"token_hash" json:"token_hash"`
+}
+
+func (q *Queries) ValidateAndRefreshSession(ctx context.Context, arg ValidateAndRefreshSessionParams) (Session, error) {
+	row := q.db.QueryRow(ctx, validateAndRefreshSession, arg.IdleTimeout, arg.TokenHash)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.IdleExpiresAt,
+		&i.AbsoluteExpiresAt,
+		&i.LastActivityAt,
+		&i.CreatedAt,
+		&i.RevokedAt,
 	)
 	return i, err
 }

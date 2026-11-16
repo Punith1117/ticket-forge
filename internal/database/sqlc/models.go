@@ -150,6 +150,7 @@ type Session struct {
 	AbsoluteExpiresAt pgtype.Timestamptz `db:"absolute_expires_at" json:"absolute_expires_at"`
 	LastActivityAt    pgtype.Timestamptz `db:"last_activity_at" json:"last_activity_at"`
 	CreatedAt         pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	RevokedAt         pgtype.Timestamptz `db:"revoked_at" json:"revoked_at"`
 }
 
 type TicketCategory struct {

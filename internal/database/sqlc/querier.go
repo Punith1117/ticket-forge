@@ -32,6 +32,8 @@ type Querier interface {
 	ListActiveVenues(ctx context.Context) ([]Venue, error)
 	ListEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error)
 	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)
+	RevokeSessionByID(ctx context.Context, id pgtype.UUID) (int64, error)
+	ValidateAndRefreshSession(ctx context.Context, arg ValidateAndRefreshSessionParams) (Session, error)
 }
 
 var _ Querier = (*Queries)(nil)

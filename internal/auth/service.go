@@ -319,6 +319,61 @@ func uuidString(u pgtype.UUID) string {
 	return id.String()
 }
 
+// uuidFromString parses a UUID string into a pgtype.UUID.
+func uuidFromString(s string) (pgtype.UUID, error) {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("invalid UUID %q: %w", s, err)
+	}
+	var u pgtype.UUID
+	copy(u.Bytes[:], id[:])
+	u.Valid = true
+	return u, nil
+}
+
+// ValidateSession atomically validates a session by its token hash and refreshes its
+// idle expiration. Returns the updated Session on success, or ErrSessionNotFound when
+// the session is unknown, revoked, idle-expired, or absolute-expired.
+//
+// Validation and idle-expiration refresh are performed in a single atomic UPDATE so
+// concurrent requests using the same session cannot race.
+// idle_expires_at is set to LEAST(now() + 30min, absolute_expires_at), ensuring the
+// absolute lifetime is never extended.
+func (s *Service) ValidateSession(ctx context.Context, tokenHash string) (sqlc.Session, error) {
+	session, err := s.queries.ValidateAndRefreshSession(ctx, sqlc.ValidateAndRefreshSessionParams{
+		TokenHash: tokenHash,
+		IdleTimeout: pgtype.Interval{
+			Microseconds: int64(SessionIdleTimeout / time.Microsecond),
+			Valid:        true,
+		},
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return sqlc.Session{}, ErrSessionNotFound
+		}
+		return sqlc.Session{}, fmt.Errorf("auth: session validation failed: %w", err)
+	}
+	return session, nil
+}
+
+// Logout revokes the session identified by sessionID.
+// Returns ErrLogoutFailed if revocation did not affect any rows (session already revoked or not found).
+func (s *Service) Logout(ctx context.Context, sessionID string) error {
+	id, err := uuidFromString(sessionID)
+	if err != nil {
+		return fmt.Errorf("auth: invalid session ID: %w", err)
+	}
+
+	rowsAffected, err := s.queries.RevokeSessionByID(ctx, id)
+	if err != nil {
+		return fmt.Errorf("auth: failed to revoke session: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrLogoutFailed
+	}
+	return nil
+}
+
 // Login authenticates a user with email and password, creates a session, and returns
 // the raw session token and session info. The caller is responsible for issuing the token
 // to the client only after this method returns successfully.

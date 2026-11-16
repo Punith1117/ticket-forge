@@ -45,3 +45,20 @@ RETURNING *;
 SELECT * FROM sessions
 WHERE token_hash = @token_hash
 LIMIT 1;
+
+-- name: ValidateAndRefreshSession :one
+UPDATE sessions
+SET
+    idle_expires_at  = LEAST(now() + @idle_timeout::interval, absolute_expires_at),
+    last_activity_at = now()
+WHERE token_hash          = @token_hash
+  AND revoked_at          IS NULL
+  AND idle_expires_at     > now()
+  AND absolute_expires_at > now()
+RETURNING *;
+
+-- name: RevokeSessionByID :execrows
+UPDATE sessions
+SET revoked_at = now()
+WHERE id         = @id
+  AND revoked_at IS NULL;

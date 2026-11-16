@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 const maxRequestBodySize = 64 * 1024 // 64 KB
@@ -34,6 +35,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/register", h.HandleRegister)
 	mux.HandleFunc("POST /api/v1/auth/register/complete", h.HandleRegisterComplete)
 	mux.HandleFunc("POST /api/v1/auth/login", h.HandleLogin)
+	mux.HandleFunc("POST /api/v1/auth/logout", h.RequireAuth(h.HandleLogout))
 }
 
 // ErrorResponse defines the standard JSON error schema.
@@ -177,4 +179,39 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, LoginResponse{
 		Message: "Login successful.",
 	})
+}
+
+// HandleLogout handles POST /api/v1/auth/logout.
+// Requires a valid authenticated session (enforced by RequireAuth).
+// Revokes the current session in the database and clears the session cookie.
+func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := UserFromContext(r.Context())
+	if !ok {
+		// Should never happen when wrapped with RequireAuth, but guard defensively.
+		h.writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		return
+	}
+
+	if err := h.service.Logout(r.Context(), authUser.SessionID); err != nil {
+		h.logger.Error("logout failed", slog.String("error", err.Error()))
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+		return
+	}
+
+	// Clear the session cookie by expiring it immediately.
+	// Cookie attributes must match those set at login to ensure the browser removes it.
+	http.SetCookie(w, &http.Cookie{
+		Name:     SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.secureCookies,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+
+	h.writeJSON(w, http.StatusOK, struct {
+		Message string `json:"message"`
+	}{Message: "Logged out successfully."})
 }
