@@ -22,45 +22,67 @@ The system must remain correct when:
 
 ## Failure Scenarios
 
-| Scenario | Risk | Expected Behavior |
-| --- | --- | --- |
-| Two customers request the final ticket | Overselling | Only one allocation succeeds |
-| Same reservation request is retried | Duplicate reservation | Return the original operation result |
-| Same idempotency key is used with a different payload | Ambiguous operation | Reject key misuse |
-| API crashes before transaction commit | Partial update | Database rolls back uncommitted transaction |
-| API crashes after commit but before response | Client retries | Idempotency returns the committed result |
-| Confirmation races with expiration | Invalid state transition | Only one transition wins |
-| Reservation cancellation races with expiration | Double inventory release | Only one transition wins |
-| Worker crashes during expiration | Incomplete work | Work remains safely retryable |
-| Outbox publisher crashes after broker publish | Duplicate event | Consumer handles duplicate delivery |
-| Broker unavailable | Delayed event publication | Outbox retains unpublished events |
-| Consumer receives duplicate event | Duplicate side effect | Consumer is idempotent |
-| Redis unavailable | Cache/rate-limit degradation | Booking correctness remains intact |
-| PostgreSQL unavailable | Booking unavailable | Fail closed; do not report successful reservation |
-| API instance crashes | Interrupted request | Client retries safely using idempotency |
-| Simulated payment fails | False confirmation | No booking is created; reservation remains Held if still eligible |
-| Payment retry occurs after expiry | Invalid confirmation | Reject confirmation |
-| Organizer changes ticket price | Historical price corruption | Existing reservations retain their price snapshots |
-| Two organizers schedule overlapping events at one venue | Double booking of venue | Only one scheduling operation succeeds |
-| Event creation races with another event creation | Venue scheduling race | Database-level protection prevents overlap |
-| Event rescheduling races with reservation creation | Event schedule changes after reservations begin | Transactional coordination ensures either rescheduling succeeds before a reservation exists, or the reservation prevents rescheduling |
-| Ticket-category capacities exceed venue capacity | Event exceeds physical venue capacity | Reject the capacity configuration |
-| Concurrent ticket-category capacity changes | Combined category capacity exceeds venue capacity | Transactional coordination ensures the aggregate capacity invariant holds |
-| Venue capacity is reduced below an active event's allocated capacity | Event exceeds physical venue capacity | Reject the venue capacity reduction |
-| Venue is deactivated while events reference it | Existing events become invalid unexpectedly | Existing events remain scheduled; deactivation prevents new event selection |
-| Event cancellation races with reservation creation | Reservation created for cancelled event | Event-level coordination prevents a reservation after cancellation takes effect |
-| Event cancellation races with reservation confirmation | Booking confirmed for a cancelled event | Only a valid transition can succeed |
-| Event cancellation races with reservation expiration | Reserved inventory released twice | State transition and inventory release are atomic |
-| Event cancellation races with customer cancellation | Reserved inventory released twice | Only one state transition wins |
-| Event cancellation while Held reservations exist | Held reservations remain confirmable or inventory remains reserved | Held reservations are invalidated and inventory is released in the cancellation transaction |
-| Event cancellation with multiple confirmed bookings | Some bookings do not receive refund work | Refund work is durably recorded for every confirmed booking |
-| Refund processing succeeds but worker crashes before recording success | Duplicate refund on retry | Idempotent refund operation safely handles retries |
-| Refund fails repeatedly | Booking remains unrefunded | Record failure details and keep refund work retryable; event remains Cancelled |
-| Refund completes | Sold inventory is accidentally restored | Refund processing does not modify inventory |
-| Event cancellation is retried | Duplicate refunds | Idempotency and uniqueness prevent duplicate refund records |
-| Worker crashes during refund processing | Incomplete refund work | Refund remains discoverable and retryable |
-| Booking availability is paused during reservation creation | Reservation created after pause | Transactional coordination ensures a reservation is accepted only if booking availability is open at the relevant validation point |
-| Booking availability is paused while a Held reservation exists | Existing reservation becomes unconfirmable | Existing Held reservation remains eligible for confirmation until its original expiry, if all other conditions hold |
+### Implemented Authentication and Asynchronous Processing Scenarios
+
+| Scenario | Risk | Expected Behavior | Status |
+| --- | --- | --- | --- |
+| Registration requested within cooldown | SMTP flooding / challenge spam | Returns 429 Too Many Requests if challenge requested within 60s | **Implemented** |
+| Registration completion with expired token (>24h) | Unauthorized account creation | Returns 400 Bad Request (`token_expired`); challenge not consumed | **Implemented** |
+| Registration completion with consumed token | Replay attack / duplicate user | Returns 400 Bad Request (`token_already_used`); atomic transaction prevents replay | **Implemented** |
+| Registration completion with invalid/malformed token | Unauthorized account creation | Returns 400 Bad Request (`invalid_token`) | **Implemented** |
+| Login with non-existent email | User enumeration via timing attack | Executes dummy Argon2id verification to equalize execution time; returns generic 401 | **Implemented** |
+| Login with wrong password | Unauthorized access | Verifies password with Argon2id; returns generic 401 without revealing error details | **Implemented** |
+| Request without session cookie | Unauthorized access | Middleware rejects request with generic 401 Unauthorized; next handler not called | **Implemented** |
+| Session idle timeout elapsed (>30 min) | Stale session access | Atomic SQL update finds zero active rows; returns 401 Unauthorized | **Implemented** |
+| Session absolute lifetime elapsed (>7 days) | Indefinite session extension | Atomic SQL update rejects request even if idle expiry was refreshed; returns 401 | **Implemented** |
+| Session revoked via logout | Revoked session access | Query filters on `revoked_at IS NULL`; returns 401 Unauthorized | **Implemented** |
+| PostgreSQL unavailable during session validation | False logout on infrastructure failure | Middleware catches DB error, logs it, and returns 500 Internal Server Error (never 401) | **Implemented** |
+| Outbox worker crashes after claiming events | Stalled event processing | Claim lease (`claim_expires_at`) expires; another worker reclaims via `SKIP LOCKED` | **Implemented** |
+| Outbox worker crashes after SMTP send before DB update | Duplicate email delivery | At-least-once delivery: email may resend; token hash in DB prevents duplicate consumption | **Implemented** |
+| SMTP server temporarily unavailable | Lost verification email | Worker logs error, applies exponential backoff with full jitter, sets `next_attempt_at` | **Implemented** |
+| Outbox event exceeds max retry attempts (5) | Infinite worker retry loop | Worker transitions event status to `failed` with `last_error` for dead-letter isolation | **Implemented** |
+
+### Planned Ticketing Pipeline Scenarios
+
+| Scenario | Risk | Expected Behavior | Status |
+| --- | --- | --- | --- |
+| Two customers request the final ticket | Overselling | Only one allocation succeeds | *Planned* |
+| Same reservation request is retried | Duplicate reservation | Return the original operation result | *Planned* |
+| Same idempotency key is used with a different payload | Ambiguous operation | Reject key misuse | *Planned* |
+| API crashes before transaction commit | Partial update | Database rolls back uncommitted transaction | *Planned* |
+| API crashes after commit but before response | Client retries | Idempotency returns the committed result | *Planned* |
+| Confirmation races with expiration | Invalid state transition | Only one transition wins | *Planned* |
+| Reservation cancellation races with expiration | Double inventory release | Only one transition wins | *Planned* |
+| Worker crashes during expiration | Incomplete work | Work remains safely retryable | *Planned* |
+| Outbox publisher crashes after broker publish | Duplicate event | Consumer handles duplicate delivery | *Planned* |
+| Broker unavailable | Delayed event publication | Outbox retains unpublished events | *Planned* |
+| Consumer receives duplicate event | Duplicate side effect | Consumer is idempotent | *Planned* |
+| Redis unavailable | Cache/rate-limit degradation | Booking correctness remains intact | *Planned* |
+| PostgreSQL unavailable | Booking unavailable | Fail closed; do not report successful reservation | *Planned* |
+| API instance crashes | Interrupted request | Client retries safely using idempotency | *Planned* |
+| Simulated payment fails | False confirmation | No booking is created; reservation remains Held if still eligible | *Planned* |
+| Payment retry occurs after expiry | Invalid confirmation | Reject confirmation | *Planned* |
+| Organizer changes ticket price | Historical price corruption | Existing reservations retain their price snapshots | *Planned* |
+| Two organizers schedule overlapping events at one venue | Double booking of venue | Only one scheduling operation succeeds | *Planned* |
+| Event creation races with another event creation | Venue scheduling race | Database-level protection prevents overlap | *Planned* |
+| Event rescheduling races with reservation creation | Event schedule changes after reservations begin | Transactional coordination ensures either rescheduling succeeds before a reservation exists, or the reservation prevents rescheduling | *Planned* |
+| Ticket-category capacities exceed venue capacity | Event exceeds physical venue capacity | Reject the capacity configuration | *Planned* |
+| Concurrent ticket-category capacity changes | Combined category capacity exceeds venue capacity | Transactional coordination ensures the aggregate capacity invariant holds | *Planned* |
+| Venue capacity is reduced below an active event's allocated capacity | Event exceeds physical venue capacity | Reject the venue capacity reduction | *Planned* |
+| Venue is deactivated while events reference it | Existing events become invalid unexpectedly | Existing events remain scheduled; deactivation prevents new event selection | *Planned* |
+| Event cancellation races with reservation creation | Reservation created for cancelled event | Event-level coordination prevents a reservation after cancellation takes effect | *Planned* |
+| Event cancellation races with reservation confirmation | Booking confirmed for a cancelled event | Only a valid transition can succeed | *Planned* |
+| Event cancellation races with reservation expiration | Reserved inventory released twice | State transition and inventory release are atomic | *Planned* |
+| Event cancellation races with customer cancellation | Reserved inventory released twice | Only one state transition wins | *Planned* |
+| Event cancellation while Held reservations exist | Held reservations remain confirmable or inventory remains reserved | Held reservations are invalidated and inventory is released in the cancellation transaction | *Planned* |
+| Event cancellation with multiple confirmed bookings | Some bookings do not receive refund work | Refund work is durably recorded for every confirmed booking | *Planned* |
+| Refund processing succeeds but worker crashes before recording success | Duplicate refund on retry | Idempotent refund operation safely handles retries | *Planned* |
+| Refund fails repeatedly | Booking remains unrefunded | Record failure details and keep refund work retryable; event remains Cancelled | *Planned* |
+| Refund completes | Sold inventory is accidentally restored | Refund processing does not modify inventory | *Planned* |
+| Event cancellation is retried | Duplicate refunds | Idempotency and uniqueness prevent duplicate refund records | *Planned* |
+| Worker crashes during refund processing | Incomplete refund work | Refund remains discoverable and retryable | *Planned* |
+| Booking availability is paused during reservation creation | Reservation created after pause | Transactional coordination ensures a reservation is accepted only if booking availability is open at the relevant validation point | *Planned* |
+| Booking availability is paused while a Held reservation exists | Existing reservation becomes unconfirmable | Existing Held reservation remains eligible for confirmation until its original expiry, if all other conditions hold | *Planned* |
 
 ## Concurrency Scenarios to Test
 

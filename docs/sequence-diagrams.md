@@ -1,9 +1,272 @@
 # Critical Sequence Diagrams
 
 **Status:** Accepted  
-**Scope:** General-admission ticketing
+**Scope:** Authentication & Lifecycle (Implemented) and General-Admission Ticketing Pipeline (Planned)
 
-## Create Event and Validate Venue Availability
+---
+
+## Part 1: Implemented Workflows
+
+### Registration Challenge Request
+
+User submits an email address. The system validates the input, checks cooldowns, persists an unauthenticated challenge, and queues an outbox event.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant API as Go API (Handler)
+    participant S as Auth Service
+    participant SEC as Security (Crypto)
+    participant DB as PostgreSQL
+
+    U->>API: POST /api/v1/auth/register {"email": "user@example.com"}
+    API->>S: RequestRegistration(ctx, email)
+    S->>S: Normalize email (lowercase, trim)
+    S->>DB: Check cooldown (active challenge in last 60s)
+
+    alt Cooldown active
+        S-->>API: ErrCooldownActive
+        API-->>U: 429 Too Many Requests
+
+    else Eligible
+        S->>SEC: GenerateToken() (256-bit random)
+        S->>SEC: HashToken(rawToken) (SHA-256)
+        S->>SEC: EncryptToken(rawToken) (AES-256-GCM)
+        S->>DB: Begin transaction
+        S->>DB: Insert registration_verification_challenges
+        S->>DB: Insert outbox_events (type: verification_email.requested)
+        S->>DB: Commit transaction
+        S-->>API: Success
+        API-->>U: 202 Accepted (generic message)
+    end
+```
+
+**Design details:**
+
+- Endpoint: `POST /api/v1/auth/register`.
+- Rate limiting: 60-second cooldown per email address.
+- Token generation: 256 bits of cryptographically secure entropy.
+- Raw token is never stored in plaintext: only the SHA-256 hash is in the challenge table, while the outbox payload holds an AES-256-GCM encrypted token.
+
+---
+
+### Outbox Processing and Verification Email Delivery
+
+The worker process leases batches of pending outbox events, decrypts tokens, delivers emails via SMTP, and records outcomes.
+
+```mermaid
+sequenceDiagram
+    participant W as Outbox Worker
+    participant DB as PostgreSQL
+    participant SEC as Security (Crypto)
+    participant SMTP as SMTP Server (Mailpit)
+
+    loop Polling Loop
+        W->>DB: ClaimPendingEvents (batch, lease_duration)
+        Note over DB: UPDATE outbox_events SET status='processing',<br/>claim_token=UUID, claim_expires_at=now()+lease<br/>WHERE status='pending' OR lease expired<br/>FOR UPDATE SKIP LOCKED
+        DB-->>W: Claimed event batch
+
+        loop Each Claimed Event
+            W->>SEC: DecryptToken(encrypted_token)
+            W->>W: Render email body with verification token
+            W->>SMTP: Send(msg) via SMTP
+
+            alt Send succeeds
+                W->>DB: MarkPublished(event_id, provider_message_id)
+            else Send fails (attempts < max)
+                W->>DB: ScheduleRetry(event_id, next_attempt_at, error)
+                Note over W,DB: Exponential backoff with jitter
+            else Send fails (attempts >= max)
+                W->>DB: MarkFailed(event_id, error)
+                Note over DB: Terminal failure (dead-letter)
+            end
+        end
+    end
+```
+
+**Design details:**
+
+- Concurrency: Multiple workers use `SKIP LOCKED` and leases (`claim_token`, `claim_expires_at`) to safely claim disjoint batches.
+- Fault tolerance: Expired leases are automatically reclaimed.
+- Retries: Exponential backoff with full jitter up to 5 attempts before terminal `failed` marking.
+- Delivery: Local development and tests use Mailpit over SMTP per ADR-013.
+
+---
+
+### Registration Completion
+
+Customer submits the raw token from the email, a password, and a display name. The challenge is atomically verified and consumed, and the user account is created.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant API as Go API (Handler)
+    participant S as Auth Service
+    participant SEC as Security (Argon2id)
+    participant DB as PostgreSQL
+
+    U->>API: POST /api/v1/auth/register/complete {"token": "...", "password": "...", "display_name": "..."}
+    API->>S: CompleteRegistration(ctx, token, password, displayName)
+    S->>SEC: HashToken(token) (SHA-256)
+    S->>S: Validate password length (12-128 chars)
+    S->>SEC: HashPassword(password) (Argon2id)
+    S->>DB: Begin transaction
+    S->>DB: Lock & verify challenge by token_hash
+
+    alt Invalid, expired (> 24h), or already consumed
+        S->>DB: Rollback
+        S-->>API: ErrTokenExpired / ErrInvalidToken / ErrTokenAlreadyConsumed
+        API-->>U: 400 Bad Request
+
+    else Valid challenge
+        S->>DB: Update challenge SET consumed_at = now()
+        S->>DB: Insert users (email, password_hash, display_name, email_verified_at=now())
+        S->>DB: Commit transaction
+        S-->>API: User details
+        API-->>U: 201 Created (User info)
+    end
+```
+
+**Design details:**
+
+- Endpoint: `POST /api/v1/auth/register/complete`.
+- Email-first registration: Accounts are created only after verification.
+- Passwords are hashed using Argon2id with memory-hard parameters.
+- Single-use challenge: Guaranteed by atomic `consumed_at` check and row locking.
+
+---
+
+### Login and Session Creation
+
+Customer authenticates with email and password. Upon successful Argon2id verification, a stateful session is persisted and a secure HTTP cookie is issued.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant API as Go API (Handler)
+    participant S as Auth Service
+    participant SEC as Security (Argon2id & Crypto)
+    participant DB as PostgreSQL
+
+    U->>API: POST /api/v1/auth/login {"email": "...", "password": "..."}
+    API->>S: Login(ctx, email, password)
+    S->>S: Normalize email
+    S->>DB: Lookup user by normalized email
+
+    alt User not found
+        S->>SEC: VerifyPassword against dummy hash
+        Note over S: Timing attack mitigation
+        S-->>API: ErrInvalidCredentials
+        API-->>U: 401 Unauthorized
+
+    else User found
+        S->>SEC: VerifyPassword(password, user.password_hash)
+        alt Password invalid
+            S-->>API: ErrInvalidCredentials
+            API-->>U: 401 Unauthorized
+        else Password valid
+            S->>SEC: GenerateToken() (256-bit secure random)
+            S->>SEC: HashToken(rawToken) (SHA-256)
+            S->>DB: Insert sessions (user_id, token_hash, idle_expires_at, absolute_expires_at)
+            S-->>API: rawToken, SessionInfo
+            API->>API: Set-Cookie: session_token=rawToken (HttpOnly, SameSite=Lax, Secure)
+            API-->>U: 200 OK
+        end
+    end
+```
+
+**Design details:**
+
+- Endpoint: `POST /api/v1/auth/login`.
+- Timing mitigation: A dummy Argon2id hash is verified when the user is not found to prevent user-enumeration timing attacks.
+- Session cookie: `HttpOnly`, `Path=/`, `SameSite=Lax`, `Secure` (env-controlled).
+- Lifetimes: Idle timeout of 30 minutes, absolute lifetime of 7 days.
+
+---
+
+### Authenticated Request and Sliding Idle Refresh
+
+Authentication middleware validates the session cookie against PostgreSQL and refreshes idle expiration atomically in a single SQL update.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant MW as Session Middleware
+    participant S as Auth Service
+    participant DB as PostgreSQL
+    participant H as Downstream Protected Handler
+
+    U->>MW: HTTP Request + Cookie: session_token
+    alt Cookie missing or empty
+        MW-->>U: 401 Unauthorized (generic)
+    else Cookie present
+        MW->>MW: Hash raw token (SHA-256)
+        MW->>S: ValidateSession(ctx, tokenHash)
+        S->>DB: UPDATE sessions SET last_activity_at = now(),<br/>idle_expires_at = LEAST(now() + 30m, absolute_expires_at)<br/>WHERE token_hash = $1 AND revoked_at IS NULL<br/>AND idle_expires_at > now() AND absolute_expires_at > now()<br/>RETURNING user_id, id
+
+        alt Session invalid, revoked, or expired
+            DB-->>S: No rows returned
+            S-->>MW: ErrSessionNotFound
+            MW-->>U: 401 Unauthorized (generic)
+
+        else Database error
+            DB-->>S: Connection/query error
+            S-->>MW: DB error
+            MW-->>U: 500 Internal Server Error
+
+        else Session valid & refreshed
+            DB-->>S: Session record (UserID, SessionID)
+            S-->>MW: Valid session
+            MW->>MW: Attach AuthenticatedUser to request context
+            MW->>H: ServeHTTP(w, r.WithContext(ctx))
+            H-->>U: Protected response
+        end
+    end
+```
+
+**Design details:**
+
+- Concurrency & atomicity: Single `UPDATE … RETURNING` query validates non-revocation, idle expiry, and absolute expiry while refreshing `idle_expires_at` clamped to `absolute_expires_at`.
+- Privacy: Downstream handlers retrieve `AuthenticatedUser{UserID, SessionID}` via private package context key. Raw tokens are never in context or logs.
+- Reliability: Database errors return 500 instead of falsely reporting 401.
+
+---
+
+### Logout and Session Revocation
+
+Authenticated user logs out. The session is revoked in PostgreSQL and the cookie is cleared with matching attributes.
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant MW as RequireAuth Middleware
+    participant H as Logout Handler
+    participant S as Auth Service
+    participant DB as PostgreSQL
+
+    U->>MW: POST /api/v1/auth/logout + Cookie: session_token
+    MW->>MW: Validate session & attach AuthenticatedUser to context
+    MW->>H: HandleLogout(w, r)
+    H->>H: Extract authUser from context
+    H->>S: Logout(ctx, authUser.SessionID)
+    S->>DB: UPDATE sessions SET revoked_at = now() WHERE id = $1
+    DB-->>S: 1 row affected
+    S-->>H: Success
+    H->>H: Set-Cookie: session_token="" (MaxAge=-1, Expires=epoch)
+    H-->>U: 200 OK ("Logged out successfully.")
+```
+
+**Design details:**
+
+- Endpoint: `POST /api/v1/auth/logout`.
+- Soft revocation: Sets `revoked_at = now()`, preventing future requests while preserving the audit trail.
+- Cookie clearing: Re-issues cookie with `MaxAge: -1` and `Expires: Unix(0,0)`.
+
+---
+
+## Part 2: Planned Workflows (General-Admission Ticketing Pipeline)
+
+### Create Event and Validate Venue Availability
 
 ```mermaid
 sequenceDiagram
@@ -11,7 +274,7 @@ sequenceDiagram
     participant API as Go API
     participant DB as PostgreSQL
 
-    O->>API: POST /events
+    O->>API: POST /api/v1/events
     API->>API: Authenticate and authorize organizer
     API->>API: Validate event details and scheduling boundaries
 
@@ -31,26 +294,9 @@ sequenceDiagram
     end
 ```
 
-**Important design considerations:**
+---
 
-- Events are created directly with the `active` lifecycle status.
-- There is no Draft or Published event state.
-- Event creation must validate the scheduling boundaries:
-  - Start at least 15 minutes in the future.
-  - Start no more than one calendar year in the future.
-  - Duration between 15 minutes and 7 days.
-- Only active venues can be selected.
-- The scheduled interval is half-open: `[starts_at, ends_at)`.
-- Only active events participate in venue conflict checks.
-- The application must not rely solely on a separate availability query followed by an insert.
-
-A simple `SELECT` followed by `INSERT` is insufficient because two organizers could simultaneously observe that a venue is available.
-
-The database must enforce the non-overlapping schedule invariant. PostgreSQL range types and exclusion constraints using GiST are the intended approach.
-
-The exact database implementation will be finalized during SQL schema design.
-
-## Reschedule Event
+### Reschedule Event
 
 ```mermaid
 sequenceDiagram
@@ -58,7 +304,7 @@ sequenceDiagram
     participant API as Go API
     participant DB as PostgreSQL
 
-    O->>API: PATCH /events/{id}/schedule
+    O->>API: PATCH /api/v1/events/{id}/schedule
     API->>API: Authenticate and authorize organizer
     API->>API: Validate proposed schedule
 
@@ -88,24 +334,9 @@ sequenceDiagram
     end
 ```
 
-**Important design considerations:**
+---
 
-- Rescheduling is allowed only if the event has never had any reservation or booking.
-- Any reservation record blocks rescheduling, including expired and cancelled reservations.
-- Any confirmed booking blocks rescheduling, including subsequently refunded bookings.
-- Reservation records must be retained for this historical check and future auditing.
-- No separate historical marker is required.
-- Cancelled events cannot be rescheduled.
-- The destination venue must be active.
-- The new schedule must satisfy all event scheduling constraints and venue-overlap rules.
-
-The event row must be locked during the operation.
-
-Reservation creation must coordinate through the same event-level locking strategy. This prevents a reservation from being created concurrently while the event is being rescheduled.
-
-The database exclusion constraint remains the final authority for venue scheduling conflicts.
-
-## Change Booking Availability
+### Change Booking Availability
 
 ```mermaid
 sequenceDiagram
@@ -113,7 +344,7 @@ sequenceDiagram
     participant API as Go API
     participant DB as PostgreSQL
 
-    O->>API: PATCH /events/{id}/booking-availability
+    O->>API: PATCH /api/v1/events/{id}/booking-availability
     API->>API: Authenticate and authorize organizer
 
     API->>DB: Begin transaction
@@ -126,37 +357,9 @@ sequenceDiagram
     API-->>O: 200 Booking availability updated
 ```
 
-**Important design considerations:**
+---
 
-Booking availability is separate from the event lifecycle.
-
-The persisted booking availability states are:
-
-- `open`
-- `paused`
-
-The default state is `open`.
-
-When booking availability is paused:
-
-- New reservations are rejected.
-- Existing Held reservations remain eligible for payment until their original expiry, provided all other confirmation conditions are satisfied.
-- Reservation expiry is not extended.
-- Reservation expiration continues normally.
-
-Effective booking availability is derived from:
-
-1. Event lifecycle.
-2. Booking availability state.
-3. Sales start time.
-4. Sales end time.
-5. Remaining inventory.
-
-Pausing booking availability must not invalidate existing Held reservations.
-
-Event cancellation is different: it prevents both new reservations and confirmations.
-
-## Reserve Tickets
+### Reserve Tickets
 
 ```mermaid
 sequenceDiagram
@@ -164,7 +367,7 @@ sequenceDiagram
     participant API as Go API
     participant DB as PostgreSQL
 
-    C->>API: POST /reservations + Idempotency-Key
+    C->>API: POST /api/v1/reservations + Idempotency-Key
 
     API->>API: Authenticate and validate request
 
@@ -202,28 +405,9 @@ sequenceDiagram
     end
 ```
 
-The reservation stores the price applicable at creation time.
+---
 
-A later ticket category price change must not affect this reservation.
-
-The initial reservation duration is two minutes.
-
-The expiration timestamp is determined by server-side policy and must not be extended by payment retries.
-
-**Important design considerations:**
-
-- The event must be active.
-- Booking availability must be `open`.
-- The sales window must permit new reservations.
-- The ticket category must be active.
-- Sufficient inventory must be available.
-- Event cancellation, rescheduling, and reservation creation must coordinate through event-level locking.
-- Inventory allocation must be atomic.
-- The database must remain the source of truth for inventory.
-
-The exact inventory locking or atomic-update strategy will be finalized during SQL and application design.
-
-## Confirm Reservation
+### Confirm Reservation
 
 ```mermaid
 sequenceDiagram
@@ -232,7 +416,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant Pay as Payment Simulator
 
-    C->>API: POST /reservations/{id}/confirm
+    C->>API: POST /api/v1/reservations/{id}/confirm
     Note over C,API: Include Idempotency-Key header
 
     API->>API: Authenticate and validate ownership
@@ -282,24 +466,9 @@ sequenceDiagram
     end
 ```
 
-**Important design considerations:**
+---
 
-- A failed payment attempt is retained.
-- A failed attempt does not release inventory.
-- The reservation remains Held if it is still eligible.
-- Payment retries do not extend the original expiration time.
-- Only one successful confirmation can create a booking.
-- The reservation price snapshot determines the amount charged.
-- Confirmation must not succeed after event cancellation.
-- Confirmation must be coordinated with event cancellation and reservation expiration.
-- A paused booking availability state does not prevent confirmation of an otherwise eligible Held reservation.
-- Confirmation must check event lifecycle, not merely booking availability.
-
-The initial simulator is local and does not involve a real external payment provider. Its execution and transaction boundary will be finalized during low-level design.
-
-Do not hold a database transaction open across a real external payment provider call in a future integration. A real payment workflow would need to handle callbacks, uncertain outcomes, and reconciliation.
-
-## Expire Reservations
+### Expire Reservations
 
 ```mermaid
 sequenceDiagram
@@ -326,19 +495,9 @@ sequenceDiagram
     end
 ```
 
-The worker must safely handle multiple instances processing the same expiration workload.
+---
 
-The reservation state transition and inventory release must occur in one transaction.
-
-Only a successful transition from Held to Expired may release reserved inventory.
-
-If a customer cancellation, event cancellation, or confirmation has already changed the reservation state, the expiration worker must not release the inventory again.
-
-`FOR UPDATE SKIP LOCKED` is a possible mechanism for allowing multiple workers to claim separate batches without waiting on one another.
-
-The exact claiming and batching strategy will be finalized during worker implementation.
-
-## Cancel Reservation
+### Cancel Reservation
 
 ```mermaid
 sequenceDiagram
@@ -346,7 +505,7 @@ sequenceDiagram
     participant API as Go API
     participant DB as PostgreSQL
 
-    C->>API: DELETE /reservations/{id}
+    C->>API: DELETE /api/v1/reservations/{id}
 
     API->>API: Authenticate and validate ownership
 
@@ -368,16 +527,9 @@ sequenceDiagram
     end
 ```
 
-**Important design considerations:**
+---
 
-- Customers can cancel their own eligible Held reservations.
-- Confirmed bookings cannot be individually cancelled in the initial version.
-- Inventory release must occur in the same transaction as the reservation state transition.
-- Only a successful Held-to-Cancelled transition releases inventory.
-- Reservation records are retained after cancellation.
-- The operation must be safe when racing with expiration or event cancellation.
-
-## Cancel Event and Initiate Refunds
+### Cancel Event and Initiate Refunds
 
 ```mermaid
 sequenceDiagram
@@ -387,7 +539,7 @@ sequenceDiagram
     participant W as Refund Worker
     participant R as Refund Simulator
 
-    O->>API: POST /events/{id}/cancel
+    O->>API: POST /api/v1/events/{id}/cancel
 
     API->>API: Authenticate and authorize organizer
     API->>DB: Begin transaction
@@ -433,30 +585,9 @@ sequenceDiagram
     end
 ```
 
-**Important design considerations:**
+---
 
-- Event cancellation and Held reservation invalidation happen in one database transaction.
-- The event becomes cancelled permanently.
-- Outstanding Held reservations are invalidated and their reserved inventory is released exactly once.
-- Confirmation must not succeed after event cancellation.
-- New reservations must not be accepted after event cancellation.
-- Refund records are created for confirmed bookings as part of the cancellation transaction.
-- The initial release supports one refund record per booking.
-- A unique constraint on `refunds.booking_id` prevents duplicate refund records.
-- Refund execution happens asynchronously.
-- The cancellation transaction does not wait for refund execution.
-- Refund retries operate on the existing refund record.
-- A failed refund must not reactivate the event.
-- Refunding a booking does not restore sold inventory.
-- A booking remains a historical record after it has been refunded.
-
-Creating the refund records in the cancellation transaction ensures that every confirmed booking has durable refund work associated with the cancellation before the transaction commits.
-
-The refund worker can then claim pending refund records and process them independently.
-
-The exact refund status transitions, retry policy, and simulated provider idempotency strategy will be finalized during low-level design.
-
-## Publish Outbox Events
+### Publish Outbox Events to Message Broker (Planned External Transport)
 
 ```mermaid
 sequenceDiagram
@@ -491,35 +622,3 @@ sequenceDiagram
         Consumer-->>B: Acknowledge
     end
 ```
-
-**Important design considerations:**
-
-- Business changes and their corresponding outbox records must be committed in the same database transaction.
-- The publisher must safely handle multiple instances.
-- The publisher can crash after publishing but before marking the event as published.
-- Consequently, duplicate message delivery is possible.
-- Consumers must be idempotent.
-- A message must not be acknowledged before its business operation is durably committed.
-- The outbox is the durable record of work that still needs publication.
-
-This design provides reliable at-least-once publication rather than assuming exactly-once message delivery.
-
-The exact event schema, claiming strategy, and consumer deduplication mechanism will be finalized during asynchronous processing design.
-
-## Important Implementation Questions
-
-The following questions remain for low-level design:
-
-- Which concurrency-control strategy protects inventory?
-- What consistent row-locking order should reservation creation, confirmation, cancellation, and event rescheduling follow?
-- How are idempotency records committed atomically with business operations?
-- Should failed idempotency responses be stored?
-- How do multiple workers safely claim expiration jobs?
-- How do we enforce venue non-overlap at the database level?
-- How should venue-capacity and ticket-category-capacity changes be coordinated with inventory operations?
-- What happens if an event is published but the publisher crashes before marking it published?
-- How do consumers persist deduplication records?
-- How do refund workers claim and retry refund operations safely?
-- What API status codes and error formats should be standardized?
-- How will simulated payment and refund outcomes be deterministic in tests?
-- What retry limits and dead-letter handling should apply to asynchronous operations?

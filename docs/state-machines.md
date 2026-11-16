@@ -1,8 +1,124 @@
 # State Machines
 
-**Status:** Accepted
+**Status:** Accepted  
+**Scope:** Authentication & System Lifecycles (Implemented) and Ticketing Pipeline (Planned)
 
-## Event Lifecycle
+---
+
+## Part 1: Implemented State Machines
+
+### Registration Verification Challenge Lifecycle
+
+*(Implemented)*
+
+A registration verification challenge is created when a user initiates registration via `POST /api/v1/auth/register`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: Challenge created (expires in 24h)
+
+    Active --> Consumed: CompleteRegistration succeeds
+    Active --> Expired: 24h expiration elapsed
+
+    Consumed --> [*]
+    Expired --> [*]
+```
+
+#### Challenge States
+
+| State | Condition | Meaning |
+| --- | --- | --- |
+| `active` | `consumed_at IS NULL AND now() < expires_at` | Valid challenge. Can be completed with password and display name. |
+| `consumed` | `consumed_at IS NOT NULL` | Terminal. Successfully used to create a `User` account. Cannot be reused. |
+| `expired` | `consumed_at IS NULL AND now() >= expires_at` | Terminal. Passed 24-hour validity window. Rejected upon submission. |
+
+#### Rules
+
+- Challenge token hash is validated via constant-time comparison in SQL.
+- Atomic verification and consumption in a single transaction (`UPDATE … SET consumed_at = now() WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()`) prevents race conditions and token reuse.
+
+---
+
+### Session Lifecycle
+
+*(Implemented)*
+
+A stateful session is created in PostgreSQL upon successful login via `POST /api/v1/auth/login`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: Login succeeds
+
+    Active --> Active: Request within 30m (sliding idle refresh)
+    Active --> Revoked: User logs out (POST /auth/logout)
+    Active --> IdleExpired: 30m of inactivity elapsed
+    Active --> AbsoluteExpired: 7 days elapsed since login
+
+    Revoked --> [*]
+    IdleExpired --> [*]
+    AbsoluteExpired --> [*]
+```
+
+#### Session States
+
+| State | Condition | Meaning |
+| --- | --- | --- |
+| `active` | `revoked_at IS NULL AND now() < idle_expires_at AND now() < absolute_expires_at` | Valid session. Authenticated requests succeed and refresh idle expiration. |
+| `revoked` | `revoked_at IS NOT NULL` | Terminal. Explicitly invalidated upon logout. Requests return 401. |
+| `idle_expired` | `revoked_at IS NULL AND now() >= idle_expires_at` | Terminal. No activity within 30 minutes. Requests return 401. |
+| `absolute_expired` | `revoked_at IS NULL AND now() >= absolute_expires_at` | Terminal. Maximum 7-day lifetime reached. Requests return 401. |
+
+#### Rules
+
+- Sliding idle expiration is refreshed atomically in PostgreSQL on each authenticated request:
+  `idle_expires_at = LEAST(now() + interval '30 minutes', absolute_expires_at)`.
+- Sliding refresh never extends `absolute_expires_at`.
+- Revoked sessions are retained for auditability (`revoked_at timestamptz`).
+- Invalidation returns a generic 401 Unauthorized without disclosing whether the session was revoked, idle-expired, or absolutely expired.
+
+---
+
+### Outbox Event Lifecycle
+
+*(Implemented)*
+
+Transactional outbox records are written atomically with business state changes and processed asynchronously by background workers.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: Business transaction commits
+
+    Pending --> Processing: Worker claims event lease
+    Processing --> Published: Event delivered successfully
+    Processing --> Pending: Transient failure (retry scheduled with backoff)
+    Processing --> Failed: Max attempts exceeded (terminal failure)
+
+    Published --> [*]
+    Failed --> [*]
+```
+
+#### Outbox Event States
+
+| State | Constraint | Meaning |
+| --- | --- | --- |
+| `pending` | `status = 'pending'` | Event ready to be claimed when `now() >= next_attempt_at`. |
+| `processing` | `status = 'processing' AND claim_token IS NOT NULL` | Exclusively leased by a worker until `claim_expires_at`. |
+| `published` | `status = 'published' AND published_at IS NOT NULL` | Terminal. Successfully sent via SMTP/broker. |
+| `failed` | `status = 'failed'` | Terminal. Reached maximum retry limit (5 attempts) or unrecoverable error. |
+
+#### Rules
+
+- Lease acquisition uses `FOR UPDATE SKIP LOCKED` to allow multiple concurrent worker instances without lock contention.
+- If a worker crashes while processing, the lease expires (`claim_expires_at < now()`) and the event is safely reclaimed by another worker.
+- Retry backoff uses exponential delays with full jitter: `base * 2^(attempt-1) + jitter`.
+
+---
+
+## Part 2: Planned State Machines (Ticketing Pipeline)
+
+### Event Lifecycle
+
+*(Schema-only)*
 
 An event is created directly in the `active` state. It does not have Draft or Published states.
 

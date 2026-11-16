@@ -143,25 +143,35 @@ Platform-operated processes also maintain the initial venue catalog.
 
 ### FR-01: Identity and Access Management
 
-- Users can register and authenticate.
-- Every registered user can perform customer operations.
-- Users can obtain an organizer profile.
-- Organizer activation is immediate in the initial version.
-- Organizer-only operations require an organizer profile.
-- Organizers can manage only their own events.
-- Customers can access only their own private reservations and bookings.
+**Status:** Partially Implemented
+
+- Users can register using an email-first challenge flow. *(Implemented)*
+- Password hashing using Argon2id with memory-hard parameters. *(Implemented)*
+- Users can authenticate with email and password to receive a stateful session cookie. *(Implemented)*
+- Stateful sessions in PostgreSQL with sliding 30-minute idle expiration and 7-day absolute lifetime. *(Implemented)*
+- Session authentication middleware attaches user identity to request context. *(Implemented)*
+- Users can log out, revoking their session and clearing their cookie. *(Implemented)*
+- Every registered user can perform customer operations. *(Implemented in domain model)*
+- Users can obtain an organizer profile. *(Schema-only: table exists, endpoint pending)*
+- Organizer activation is immediate in the initial version. *(Pending)*
+- Organizer-only operations require an organizer profile. *(Pending)*
+- Organizers can manage only their own events. *(Pending)*
+- Customers can access only their own private reservations and bookings. *(Pending)*
 
 ### FR-02: Venue Catalog
 
-- The platform maintains a catalog of venues.
+**Status:** Schema-Only
+
+- The platform maintains a catalog of venues. *(Schema and sqlc queries exist)*
 - Venue records contain:
   - Name.
+  - Slug (unique URL identifier).
   - Structured address fields, including street address, city, state, postal code, and country code.
   - IANA timezone.
   - Physical capacity.
-  - Active/inactive state.
-- Country codes use ISO 3166-1 alpha-2.
-- Organizers can browse and select existing active venues.
+  - Active/inactive state (`is_active`).
+- Country codes use ISO 3166-1 alpha-2 (`'IN'`).
+- Organizers can browse and select existing active venues. *(Pending)*
 - Organizers cannot create or modify venue records through the initial application.
 - Venue catalog entries are maintained through controlled operational processes.
 - A venue can host multiple events, provided their scheduled intervals do not overlap.
@@ -174,6 +184,8 @@ Platform-operated processes also maintain the initial venue catalog.
 - Increasing venue capacity does not automatically increase existing event ticket-category capacities.
 
 ### FR-03: Event Management and Scheduling
+
+**Status:** Schema-Only (Table with exclusion constraint and sqlc queries exist; API routes pending)
 
 - Organizers can create events at existing active venues.
 - Each event belongs to exactly one organizer.
@@ -230,6 +242,8 @@ Non-cancelled events at the same venue must not have overlapping scheduled inter
 
 ### FR-04: Ticket Category Management
 
+**Status:** Schema-Only
+
 - Organizers can create ticket categories for an event.
 - An event can have zero or more ticket categories.
 - Each category has a name, current price, currency, and allocated capacity.
@@ -243,6 +257,8 @@ Non-cancelled events at the same venue must not have overlapping scheduled inter
 - Capacity changes must be coordinated transactionally with reservation and booking operations.
 
 ### FR-05: Booking Availability Controls
+
+**Status:** Schema-Only
 
 Booking availability is separate from the event lifecycle.
 
@@ -276,6 +292,8 @@ Event cancellation overrides booking availability and prevents new reservations 
 
 ### FR-06: Event Discovery
 
+**Status:** Pending
+
 - Customers can browse active events.
 - Customers can view event details.
 - Customers can view ticket categories and their availability.
@@ -283,6 +301,8 @@ Event cancellation overrides booking availability and prevents new reservations 
 - Customers must not be able to reserve tickets for cancelled events.
 
 ### FR-07: Reservation Management
+
+**Status:** Schema-Only
 
 - Customers can reserve a positive quantity of tickets.
 - Reservations temporarily hold inventory.
@@ -299,6 +319,8 @@ Event cancellation overrides booking availability and prevents new reservations 
 
 ### FR-08: Payment and Booking
 
+**Status:** Schema-Only
+
 - Customers can attempt to confirm eligible reservations through simulated payment.
 - Simulated payment can produce success or failure.
 - Failed payment attempts are retained.
@@ -313,6 +335,8 @@ Event cancellation overrides booking availability and prevents new reservations 
 - Individual confirmed bookings cannot be cancelled in the initial release.
 
 ### FR-09: Event Cancellation and Refunds
+
+**Status:** Schema-Only
 
 - Organizers can cancel their own active events.
 - Event cancellation is terminal.
@@ -333,6 +357,8 @@ Event cancellation overrides booking availability and prevents new reservations 
 
 ### FR-10: Inventory Correctness
 
+**Status:** Schema-Only
+
 - The system must prevent overselling.
 - Concurrent reservation attempts must be handled safely.
 - Inventory must be released after reservation expiration.
@@ -346,6 +372,8 @@ Event cancellation overrides booking availability and prevents new reservations 
 
 ### FR-11: Idempotency
 
+**Status:** Schema-Only
+
 - Reservation and confirmation endpoints support idempotency keys.
 - Repeating an operation with the same key must not create duplicate logical operations.
 - Reusing a key with a different request payload must be rejected.
@@ -354,22 +382,29 @@ Event cancellation overrides booking availability and prevents new reservations 
 
 ### FR-12: Asynchronous Processing
 
-- Background workers process reservation expiration.
-- Business events are recorded for reliable publication.
-- Event cancellation durably records the work required for asynchronous refund processing.
-- Event cancellation and Held reservation invalidation must be committed consistently.
-- Failed asynchronous operations can be retried.
-- Repeatedly failing messages can be isolated.
-- Consumers safely handle duplicate message delivery.
-- Worker restarts must not cause duplicate inventory release, booking confirmation, or refunds.
+**Status:** Partially Implemented
+
+- Transactional outbox persistence and worker claiming with leases (`claim_token`, `claim_expires_at`). *(Implemented)*
+- Exponential backoff retry with full jitter and terminal failure marking. *(Implemented)*
+- Transactional email dispatch via Mailpit/SMTP. *(Implemented)*
+- Background workers process reservation expiration. *(Pending)*
+- Business events are recorded for reliable publication. *(Outbox implemented; message broker transport pending)*
+- Event cancellation durably records the work required for asynchronous refund processing. *(Pending)*
+- Event cancellation and Held reservation invalidation must be committed consistently. *(Pending)*
+- Failed asynchronous operations can be retried. *(Implemented for outbox worker)*
+- Repeatedly failing messages can be isolated. *(Implemented via `status = 'failed'` dead-letter)*
+- Consumers safely handle duplicate message delivery. *(Pending)*
+- Worker restarts must not cause duplicate inventory release, booking confirmation, or refunds. *(Pending)*
 
 ### FR-13: Operations and Observability
 
-- The API exposes health endpoints.
-- The system provides structured logs.
-- Requests can be correlated across API and worker processes.
-- The system exposes relevant metrics.
-- Operators can inspect failed asynchronous work through controlled operational mechanisms.
+**Status:** Partially Implemented
+
+- The API exposes health endpoints (`GET /healthz`). *(Implemented)*
+- The system provides structured JSON logs via `log/slog`. *(Implemented)*
+- Requests can be correlated across API and worker processes. *(Pending)*
+- The system exposes relevant metrics. *(Prometheus/Grafana pending)*
+- Operators can inspect failed asynchronous work through controlled operational mechanisms. *(Pending)*
 
 ## Non-Functional Requirements
 

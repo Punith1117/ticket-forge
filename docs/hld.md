@@ -100,26 +100,25 @@ The broker is not required for a normal reservation transaction to commit. Busin
 
 ### Identity and Access
 
+*(Implemented)*
+
 Responsibilities:
 
-- User registration.
-- Email verification.
-- Authentication and session management.
-- Organizer profile creation.
-- Authorization.
-- Resource ownership.
+- Email-first user registration challenge issuance and verification.
+- Password hashing and verification using Argon2id.
+- Stateful session creation, storage, and validation.
+- Session authentication middleware (sliding 30-min idle timeout, 7-day absolute lifetime).
+- Session revocation on logout.
+- AES-256-GCM encryption of outbox payloads using a versioned KeyRing.
+- Authorization and resource ownership context (`UserFromContext`).
 
-Every registered user has customer capabilities. Organizer capabilities are granted through an organizer profile.
+Every registered user has customer capabilities. Organizer capabilities are granted through an organizer profile (schema exists; profile creation endpoint is pending).
 
-The initial authentication model uses email/password authentication and stateful sessions.
-
-Passwords are hashed using Argon2id. Session tokens are generated securely, while only their hashes are persisted.
-
-Email verification is required before users can reserve tickets or activate organizer capabilities.
-
-Organizer activation is immediate after the required verification and profile creation. There is no separate approval workflow in the initial version.
+Email verification is required before account creation: users do not exist in the database until completing registration with a valid verification challenge.
 
 ### Catalog
+
+*(Schema-only)*
 
 Responsibilities:
 
@@ -131,24 +130,11 @@ Responsibilities:
 - Venue scheduling validation.
 - Venue capacity validation.
 
-Organizers can select existing active venues but cannot freely create or modify venue records through the application.
-
-Each event belongs to exactly one organizer and references one venue.
-
-Events are created directly with lifecycle status `active`. There is no Draft or Published state.
-
-Event lifecycle and booking availability are separate:
-
-- Event lifecycle: `active`, `cancelled`.
-- Booking availability: `open`, `paused`.
-
-Event completion is derived from its schedule and is not persisted as a lifecycle state.
-
-The catalog must prevent overlapping active events at the same venue. PostgreSQL exclusion constraints provide authoritative protection against concurrent scheduling conflicts.
-
-The total allocated capacity of an event's ticket categories must not exceed its venue's physical capacity. This aggregate invariant requires transactional coordination.
+Venues, events, and ticket categories have database schemas and sqlc queries generated, but HTTP handlers and service layer are pending implementation.
 
 ### Inventory
+
+*(Schema-only)*
 
 Responsibilities:
 
@@ -158,19 +144,11 @@ Responsibilities:
 - Inventory invariants.
 - Concurrency control.
 
-PostgreSQL is authoritative for inventory.
-
-For each ticket category:
-
-```text
-available = capacity - reserved_quantity - sold_quantity
-```
-
-Inventory transitions must occur atomically with their corresponding reservation or booking state transitions.
-
-Redis must never become the authoritative inventory store.
+PostgreSQL schema exists (`inventory` table tracking `reserved_quantity` and `sold_quantity`). Service logic pending implementation.
 
 ### Booking
+
+*(Schema-only)*
 
 Responsibilities:
 
@@ -181,15 +159,11 @@ Responsibilities:
 - Idempotency coordination.
 - Historical price snapshots.
 
-Reservations initially have a two-minute lifetime.
-
-A reservation can produce at most one booking.
-
-Expired and cancelled Held reservations release their reserved inventory exactly once.
-
-Confirmed bookings remain historical records. Individual confirmed-booking cancellation is not supported in the initial version.
+Schema exists (`reservations`, `bookings`). Service logic pending implementation.
 
 ### Payment Simulation
+
+*(Schema-only)*
 
 Responsibilities:
 
@@ -198,13 +172,11 @@ Responsibilities:
 - Payment attempt persistence.
 - Payment retries while a reservation remains eligible.
 
-Failed payment attempts are retained.
-
-A failed payment does not automatically release inventory. The reservation remains Held if it is still eligible.
-
-The initial implementation uses a deterministic simulator rather than a real payment provider.
+Schema exists (`payment_attempts`). Service logic pending implementation.
 
 ### Refund Processing
+
+*(Schema-only)*
 
 Responsibilities:
 
@@ -214,31 +186,21 @@ Responsibilities:
 - Retrying failed refunds.
 - Preventing duplicate refund operations.
 
-Event cancellation performs its critical database changes synchronously:
-
-- Marks the event as `cancelled`.
-- Invalidates outstanding Held reservations.
-- Releases their reserved inventory.
-- Creates pending refund records for confirmed bookings.
-- Records the cancellation outbox event.
-
-These changes commit atomically.
-
-Actual refund execution is asynchronous. Refund processing failures do not reactivate events or restore sold inventory.
-
-There is at most one refund record per booking. Retries operate on the existing refund record.
+Schema exists (`refunds`). Service logic pending implementation.
 
 ### Asynchronous Processing
 
+*(Implemented for Outbox & Transactional Email; Planned for Event Broker & Refunds)*
+
 Responsibilities:
 
-- Transactional outbox.
-- Outbox publishing.
-- Reservation expiration.
-- Refund processing.
-- Event consumers.
-- Retry handling.
-- Duplicate message handling.
+- Transactional outbox pattern.
+- Outbox worker process with batch leasing (`claim_token`, `claim_expires_at`).
+- Exponential backoff retry with jitter and max-attempt failure handling.
+- SMTP transactional email dispatch (Mailpit in development per ADR-013).
+- Reservation expiration worker (planned).
+- Asynchronous refund worker (planned).
+- External message broker transport (planned).
 
 The transactional outbox ensures that business changes and corresponding event records are committed atomically.
 
@@ -359,35 +321,36 @@ Stateful authentication sessions are persisted in PostgreSQL, allowing requests 
 
 | Concern | Technology | Decision |
 | --- | --- | --- |
-| Language | Go | Selected |
-| API | REST over HTTP | Selected |
-| Database | PostgreSQL 18 | Selected |
-| PostgreSQL driver | pgx/v5 and pgxpool | Selected |
-| Query generation | sqlc | Selected |
-| Migrations | Goose | Selected |
-| Local infrastructure | Compose | Selected |
-| Cache and rate limiting | Redis | Selected |
-| Messaging | Message broker | To be selected |
-| Authentication | Email/password and stateful sessions | Selected |
-| Password hashing | Argon2id | Selected |
-| Email delivery | Resend | Selected |
-| API testing | Bruno and curl | Selected |
-| Metrics | Prometheus | Selected |
-| Dashboards | Grafana | Selected |
-| Load testing | To be selected |
-| Reverse proxy | To be selected |
+| Language | Go | Selected & Implemented |
+| API Routing | `net/http` ServeMux (Go 1.22+) | Selected & Implemented |
+| Database | PostgreSQL 18 | Selected & Implemented |
+| PostgreSQL driver | pgx/v5 and pgxpool | Selected & Implemented |
+| Query generation | sqlc | Selected & Implemented |
+| Migrations | Goose | Selected & Implemented |
+| Local infrastructure | Docker Compose | Selected & Implemented |
+| Authentication | Email-first registration, Argon2id, stateful sessions in PostgreSQL | Selected & Implemented |
+| Session transport | Secure HTTP cookies (HttpOnly, SameSite=Lax) | Selected & Implemented |
+| Password hashing | Argon2id | Selected & Implemented |
+| Token encryption | AES-256-GCM with versioned KeyRing | Selected & Implemented |
+| Asynchronous outbox worker | Polling PostgreSQL outbox with batch leasing | Selected & Implemented |
+| Email delivery | SMTP (Mailpit for dev/test, Resend for prod) | Selected & Implemented |
+| Cache and rate limiting | PostgreSQL & Redis | Planned |
+| Messaging | Message broker | Planned |
+| API testing | Bruno, curl, Go integration tests | Selected & Implemented |
+| Metrics | Prometheus | Planned |
+| Dashboards | Grafana | Planned |
+| Load testing | To be selected | Planned |
+| Reverse proxy | To be selected | Planned |
 
 ## Decisions Deferred Until Implementation
 
 The following decisions remain open and should be made when their corresponding implementation phases approach:
 
-- Go HTTP router.
-- Message broker.
-- Redis client.
-- Reverse proxy and load balancer.
+- Message broker selection.
+- Redis client selection.
+- Reverse proxy and load balancer selection.
 - Exact deployment topology.
 - Load-testing tool.
-- Detailed worker claiming, retry, and backoff policies.
 - Outbox retention and cleanup policy.
 - Consumer deduplication strategy.
 - Detailed database locking strategy for aggregate venue capacity.

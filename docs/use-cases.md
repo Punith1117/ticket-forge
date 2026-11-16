@@ -64,11 +64,13 @@ flowchart LR
     Organizer[Organizer]
     ReservationWorker[Reservation Worker]
     RefundWorker[Refund Worker]
-    OutboxPublisher[Outbox Publisher]
+    OutboxWorker[Outbox Worker]
     PlatformOperator[Platform Operator]
 
     subgraph TicketForge
-        Register((Register and authenticate))
+        Register((Register via email challenge))
+        Authenticate((Log in and create session))
+        Logout((Log out and revoke session))
         BecomeOrganizer((Become an organizer))
 
         Browse((Browse events))
@@ -87,12 +89,14 @@ flowchart LR
 
         Expire((Expire reservations))
         ProcessRefund((Process refunds))
-        PublishOutbox((Publish outbox events))
+        DeliverOutbox((Deliver outbox emails))
 
         MaintainVenues((Maintain venue catalog))
     end
 
     User --> Register
+    User --> Authenticate
+    User --> Logout
     User --> BecomeOrganizer
 
     Customer --> Browse
@@ -111,48 +115,121 @@ flowchart LR
 
     ReservationWorker --> Expire
     RefundWorker --> ProcessRefund
-    OutboxPublisher --> PublishOutbox
+    OutboxWorker --> DeliverOutbox
     PlatformOperator --> MaintainVenues
 ```
 
 ## Use-Case Details
 
-### UC-01: Register and Authenticate
+### UC-01: Register via Email Verification
+
+*(Implemented)*
 
 **Actor:** User
 
-**Preconditions:** User does not already have an account with the submitted email address.
+**Preconditions:** No active user account exists with the submitted email address.
 
 **Main flow:**
 
-1. User submits registration information.
-2. API validates the input.
-3. Password is securely hashed using Argon2id.
-4. User account is persisted.
-5. System creates an email verification token.
-6. Verification email is queued for delivery.
-7. User verifies their email address.
-8. User authenticates using their email and password.
-9. System creates a stateful session.
-10. User receives the session credential.
+1. User requests registration by submitting an email address (`POST /api/v1/auth/register`).
+2. API validates and normalizes the email address.
+3. System verifies no active challenge was issued within the 60-second cooldown period.
+4. System generates a 256-bit cryptographically secure token, hashes it with SHA-256, and encrypts it with AES-256-GCM.
+5. In a single database transaction, system inserts a `registration_verification_challenges` record (24-hour expiration) and an `outbox_events` record with the encrypted token payload.
+6. API returns `202 Accepted` with a generic message.
+7. Outbox Worker claims the outbox event and sends the verification email via SMTP (Mailpit in development).
+8. User receives the raw verification token and submits it along with password and display name (`POST /api/v1/auth/register/complete`).
+9. System validates password requirements (12–128 characters) and hashes it using Argon2id.
+10. In a single database transaction:
+    - Challenge is looked up by token hash and locked.
+    - System verifies challenge is not expired and not consumed.
+    - Challenge is marked consumed (`consumed_at = now()`).
+    - User account is persisted in `users` with `email_verified_at = now()`.
+11. API returns `201 Created` with user details.
 
 **Failure cases:**
 
-- Invalid input.
-- Duplicate email.
-- Password policy violation.
-- Email delivery failure.
-- Invalid or expired verification token.
-- Database failure.
+- Invalid email format (400 Bad Request).
+- Cooldown period active (429 Too Many Requests).
+- Invalid, expired, or already consumed token (400 Bad Request).
+- Password shorter than 12 characters or longer than 128 characters (400 Bad Request).
+- Email already registered upon completion (409 Conflict).
+- Database or SMTP failure (500 Internal Server Error).
 
 **Rules:**
 
-- Email verification is required before a user can reserve tickets or activate organizer capabilities.
-- An unverified user may register and authenticate.
-- Sessions are persisted and can be revoked.
-- Session tokens are generated securely; only their hashes are stored.
+- TicketForge strictly uses email-first registration: unverified accounts are never persisted in the `users` table.
+- Verification tokens expire after 24 hours.
+- A challenge can be consumed at most once (`consumed_at` check).
+- Raw tokens are never stored in the database or logs.
+
+---
+
+### UC-01b: Authenticate (Log In)
+
+*(Implemented)*
+
+**Actor:** Registered User
+
+**Preconditions:** User has completed registration.
+
+**Main flow:**
+
+1. User submits email and password (`POST /api/v1/auth/login`).
+2. API normalizes email and looks up user in PostgreSQL.
+3. System verifies submitted password against stored Argon2id hash.
+4. If email is not found, system executes a dummy Argon2id verification to equalize execution time and mitigate user enumeration timing attacks.
+5. System generates a 256-bit secure random session token and hashes it with SHA-256.
+6. System inserts a stateful session record in `sessions` with a 30-minute idle expiration and a 7-day absolute lifetime.
+7. API issues an HTTP cookie `session_token` with `HttpOnly`, `Path=/`, `SameSite=Lax`, and `Secure` (environment-driven).
+8. API returns `200 OK` with a success message.
+
+**Failure cases:**
+
+- Malformed or invalid JSON payload (400 Bad Request).
+- Unknown email, incorrect password, or unverified account (401 Unauthorized with generic message).
+- Database failure (500 Internal Server Error).
+
+**Rules:**
+
+- Authentication failures return generic messages and never disclose whether the email exists.
+- The raw session token is never stored in PostgreSQL (only SHA-256 hash).
+- Downstream requests pass through session authentication middleware, which verifies the token hash and atomically refreshes the sliding 30-minute idle expiration (clamped to the 7-day absolute lifetime).
+
+---
+
+### UC-01c: Log Out
+
+*(Implemented)*
+
+**Actor:** Authenticated User
+
+**Preconditions:** User has a valid, active session cookie.
+
+**Main flow:**
+
+1. User sends a logout request (`POST /api/v1/auth/logout`).
+2. Session authentication middleware validates the session token against PostgreSQL, confirms it is not expired or revoked, and attaches the authenticated user identity to context.
+3. Logout handler revokes the session by updating `sessions.revoked_at = now()`.
+4. API re-issues the `session_token` cookie with empty value, `MaxAge: -1`, and `Expires: Unix(0,0)` to instruct the browser to clear it immediately.
+5. API returns `200 OK` with a success message.
+
+**Failure cases:**
+
+- Missing or invalid session cookie (401 Unauthorized).
+- Database failure (500 Internal Server Error).
+
+**Rules:**
+
+- Revocation is soft (`revoked_at timestamptz`), preserving audit history.
+- Revoked sessions are immediately rejected by middleware on subsequent requests.
+- Cookie clearing attributes match original issuance attributes.
+
+---
 
 ### UC-02: Become an Organizer
+
+*(Schema-only / Planned)*
 
 **Actor:** Authenticated User
 
@@ -184,6 +261,8 @@ flowchart LR
 
 ### UC-03: Select a Venue
 
+*(Schema-only / Planned)*
+
 **Actor:** Organizer
 
 **Preconditions:** User has a verified email address and an organizer profile.
@@ -206,6 +285,8 @@ flowchart LR
 - Venue capacity places an upper bound on the total allocated ticket category capacity for an event.
 
 ### UC-04: Create an Event
+
+*(Schema-only / Planned)*
 
 **Actor:** Organizer
 
@@ -245,6 +326,8 @@ flowchart LR
 - The database exclusion constraint is authoritative for concurrent scheduling operations.
 
 ### UC-05: Reschedule an Event
+
+*(Schema-only / Planned)*
 
 **Actor:** Organizer
 
@@ -290,6 +373,8 @@ flowchart LR
 
 ### UC-06: Manage Ticket Categories and Prices
 
+*(Schema-only / Planned)*
+
 **Actor:** Organizer
 
 **Preconditions:**
@@ -321,6 +406,8 @@ flowchart LR
 
 ### UC-07: Browse Events
 
+*(Planned)*
+
 **Actor:** Customer
 
 **Main flow:**
@@ -346,6 +433,8 @@ flowchart LR
 - A subsequent reservation attempt must revalidate all conditions transactionally.
 
 ### UC-08: Pause or Resume Bookings
+
+*(Schema-only / Planned)*
 
 **Actor:** Organizer
 
@@ -375,6 +464,8 @@ flowchart LR
 - Event cancellation overrides booking availability.
 
 ### UC-09: Reserve Tickets
+
+*(Schema-only / Planned)*
 
 **Actor:** Customer
 
@@ -429,6 +520,8 @@ flowchart LR
 
 ### UC-10: Confirm Reservation
 
+*(Schema-only / Planned)*
+
 **Actor:** Customer
 
 **Preconditions:**
@@ -477,6 +570,8 @@ flowchart LR
 
 ### UC-11: Cancel Held Reservation
 
+*(Schema-only / Planned)*
+
 **Actor:** Customer
 
 **Preconditions:**
@@ -515,6 +610,8 @@ flowchart LR
 
 ### UC-12: Cancel Event
 
+*(Schema-only / Planned)*
+
 **Actor:** Organizer
 
 **Preconditions:**
@@ -550,6 +647,8 @@ flowchart LR
 
 ### UC-13: Expire Reservation
 
+*(Schema-only / Planned)*
+
 **Actor:** Reservation Worker
 
 **Preconditions:** Reservation has passed its expiry time and remains in Held state.
@@ -580,6 +679,8 @@ flowchart LR
 
 ### UC-14: Process Refund
 
+*(Schema-only / Planned)*
+
 **Actor:** Refund Worker
 
 **Preconditions:** A pending or retryable refund record exists for a confirmed booking associated with a cancelled event.
@@ -604,29 +705,40 @@ flowchart LR
 - A refund failure must not reactivate the event.
 - Refund processing does not restore sold inventory.
 
-### UC-15: Publish Outbox Events
+### UC-15: Deliver Outbox Emails & Publish Events
 
-**Actor:** Outbox Publisher
+*(Email delivery is Implemented; Message Broker Publishing is Planned)*
 
-**Preconditions:** Unpublished outbox records exist.
+**Actor:** Outbox Worker / Publisher
 
-**Main flow:**
+**Preconditions:** Pending outbox records exist in PostgreSQL.
 
-1. Publisher discovers unpublished outbox records.
-2. Publisher claims records safely.
-3. Publisher publishes messages to the message broker.
-4. Publisher marks successfully published records as published.
-5. Processing continues for remaining records.
+**Main flow (Email Delivery - Implemented):**
+
+1. Outbox Worker discovers pending outbox records or records with expired leases.
+2. Worker claims a batch of events with a lease token and duration using `FOR UPDATE SKIP LOCKED`.
+3. Worker parses the payload and decrypts the sensitive token using the versioned KeyRing.
+4. Worker formats the email and sends it via SMTP (Mailpit in development).
+5. On success, worker updates the record to `status = 'published'` with `published_at = now()`.
+6. On transient failure, worker applies exponential backoff with jitter and sets `next_attempt_at`.
+7. On repeated failure exceeding 5 attempts, worker transitions the record to `status = 'failed'` with the error message.
+
+**Planned flow (Message Broker Publishing):**
+
+1. Publisher discovers unpublished business events.
+2. Publisher publishes messages to the external message broker.
+3. Publisher marks successfully published records as published.
 
 **Failure and recovery behavior:**
 
-- Publisher may crash after publishing but before marking a record as published.
-- Such a record may be published again.
-- Delivery is therefore at least once.
-- Consumers must be idempotent and tolerate duplicate messages.
-- Outbox records must not be marked published before successful message publication.
+- Worker may crash after sending an email or publishing but before updating the database.
+- Such a record will be reclaimed when its lease expires and may be processed again.
+- Delivery is at least once. Consumers and challenge verification must be idempotent.
+- Expired leases are automatically reclaimed by running worker instances.
 
 ### UC-16: View Booking History
+
+*(Schema-only / Planned)*
 
 **Actor:** Customer
 
@@ -647,6 +759,8 @@ flowchart LR
 
 ## Excluded Use Cases
 
+- Password-reset request and completion (schema `password_reset_tokens` exists, but application endpoints are not yet implemented).
+- Organizer profile onboarding endpoints (schema `organizer_profiles` exists, but application endpoints are not yet implemented).
 - Application-level Admin operations.
 - Manual booking overrides by an Admin.
 - Real payment capture.

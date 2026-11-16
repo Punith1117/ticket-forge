@@ -28,15 +28,43 @@ These concepts must not be represented by a single status field.
 
 ### User
 
-Represents an authenticated person.
+*(Implemented)* Represents an authenticated person.
+
+TicketForge follows an email-first registration model: a user account is created only after successful verification of an email registration challenge. Therefore, every persisted user has a verified email address (`email_verified_at`).
 
 Every user can act as a customer. A user may additionally have an OrganizerProfile.
 
 A user does not need separate accounts to act as a customer and an organizer.
 
+### RegistrationVerificationChallenge
+
+*(Implemented)* Represents an unauthenticated challenge issued when an email address requests registration.
+
+It holds:
+
+- Normalized email address.
+- Token hash (SHA-256 hash of a 256-bit cryptographically secure random token).
+- Expiration timestamp (24 hours).
+- Consumption timestamp (`consumed_at`), preventing token reuse.
+
+The challenge exists prior to and independently of the `User` entity. Upon successful completion with password and display name, the challenge is marked consumed and the `User` record is created.
+
+### Session
+
+*(Implemented)* Represents an authenticated, stateful session.
+
+It holds:
+
+- User reference.
+- Token hash (SHA-256 hash of a cryptographically secure 256-bit random cookie token).
+- Idle expiration timestamp (sliding 30-minute window, refreshed atomically on authenticated activity).
+- Absolute expiration timestamp (7-day maximum lifetime, never extended).
+- Last activity timestamp.
+- Revocation timestamp (`revoked_at`), set when the user logs out.
+
 ### OrganizerProfile
 
-Grants organizer capabilities to a User.
+*(Schema-only)* Grants organizer capabilities to a User.
 
 Organizer activation is immediate in the initial version. Identity verification and organizer approval workflows are outside the MVP scope.
 
@@ -46,7 +74,7 @@ Each event belongs to exactly one organizer.
 
 ### Venue
 
-Represents a physical location where events are hosted.
+*(Schema-only)* Represents a physical location where events are hosted.
 
 Venues are managed exclusively by the platform and maintained in a shared venue catalog.
 
@@ -83,7 +111,7 @@ Referenced venues are not physically deleted.
 
 ### Event
 
-Represents a scheduled occurrence at a physical venue.
+*(Schema-only)* Represents a scheduled occurrence at a physical venue.
 
 Each event belongs to exactly one organizer and references exactly one platform-managed venue.
 
@@ -181,7 +209,7 @@ A cancelled event cannot be booked regardless of its booking availability state.
 
 ### TicketCategory
 
-Represents a general-admission ticket type for an event.
+*(Schema-only)* Represents a general-admission ticket type for an event.
 
 Examples:
 
@@ -213,7 +241,7 @@ Automatic price tiers and scheduled early-bird transitions are deferred.
 
 ### Inventory
 
-Tracks the allocation quantities of a ticket category.
+*(Schema-only)* Tracks the allocation quantities of a ticket category.
 
 The initial model maintains:
 
@@ -246,7 +274,7 @@ Capacity changes must coordinate with reservations, payment confirmation, catego
 
 ### Reservation
 
-Represents a temporary hold on a quantity of tickets.
+*(Schema-only)* Represents a temporary hold on a quantity of tickets.
 
 It belongs to exactly one customer and one ticket category.
 
@@ -280,7 +308,7 @@ However, a Held reservation cannot be confirmed if its event has been cancelled.
 
 ### Booking
 
-Represents a confirmed ticket allocation.
+*(Schema-only)* Represents a confirmed ticket allocation.
 
 It originates from a successful reservation confirmation.
 
@@ -296,7 +324,7 @@ The booking remains a historical record of the confirmed allocation. Refund stat
 
 ### PaymentAttempt
 
-Represents an attempt to complete the simulated payment process.
+*(Schema-only)* Represents an attempt to complete the simulated payment process.
 
 It records:
 
@@ -318,7 +346,7 @@ A payment callback must not confirm a reservation belonging to a cancelled event
 
 ### Refund
 
-Represents a refund initiated because an event was cancelled.
+*(Schema-only)* Represents a refund initiated because an event was cancelled.
 
 It is associated with a confirmed booking.
 
@@ -348,7 +376,7 @@ Event cancellation must not depend on successful refund completion.
 
 ### IdempotencyRecord
 
-Stores the result of a client operation.
+*(Schema-only)* Stores the result of a client operation.
 
 It prevents retries from accidentally creating duplicate reservations or bookings.
 
@@ -358,19 +386,18 @@ A request fingerprint prevents reuse of the same key with a different payload.
 
 ### OutboxEvent
 
-A durable event record written in the same database transaction as the business change that requires publication.
+*(Implemented)* A durable event record written in the same database transaction as the business change that requires publication.
 
-An asynchronous publisher later forwards it to the message broker.
+Initially implemented for reliable transactional email delivery (e.g., registration verification tokens). A background worker leases pending events, uses exponential backoff with jitter on transient failures, sends emails via SMTP, and marks events as published or dead-letter failed. It will also support asynchronous refund workflows when implemented.
 
 The outbox is a database table, not a separate infrastructure service.
-
-It supports reliable asynchronous processing, including refund workflows and other operations that must survive process failures.
 
 ## Domain Relationships
 
 ```mermaid
 erDiagram
     USER ||--o| ORGANIZER_PROFILE : may_have
+    USER ||--o{ SESSION : has
     ORGANIZER_PROFILE ||--o{ EVENT : organizes
     VENUE ||--o{ EVENT : hosts
     EVENT ||--o{ TICKET_CATEGORY : offers
@@ -386,6 +413,8 @@ erDiagram
 
 Notes:
 
+- `REGISTRATION_VERIFICATION_CHALLENGE` precedes `USER` account creation during the email-first registration flow and intentionally has no foreign key to `USER`.
+- `SESSION` represents a stateful authenticated session belonging to a `USER`.
 - An event may exist without ticket categories.
 - A reservation can produce at most one booking.
 - A booking may have no refund or one full-refund record in the initial release.
@@ -396,11 +425,14 @@ Notes:
 
 ### Identity and Organizer Rules
 
-1. Every registered user can act as a customer.
-2. A user may have zero or one organizer profile.
-3. Organizer activation is immediate in the initial version.
-4. An organizer can manage only their own events.
-5. Each event belongs to exactly one organizer.
+1. User accounts are created only upon successful verification of an email registration challenge.
+2. Every registered user has a verified email address (`email_verified_at`) and can act as a customer.
+3. Authentication creates a stateful session with a sliding 30-minute idle expiration and a 7-day absolute lifetime.
+4. Sessions are revoked on logout and expired sessions cannot authenticate.
+5. A user may have zero or one organizer profile.
+6. Organizer activation is immediate in the initial version.
+7. An organizer can manage only their own events.
+8. Each event belongs to exactly one organizer.
 
 ### Venue Rules
 
