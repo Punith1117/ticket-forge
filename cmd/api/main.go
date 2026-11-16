@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
+	"github.com/Punith1117/ticket-forge/internal/ratelimit"
 	"github.com/Punith1117/ticket-forge/internal/security"
 )
 
@@ -60,7 +62,59 @@ func main() {
 		os.Exit(1)
 	}
 
-	authHandler := auth.NewHandler(authService, logger, os.Getenv("SECURE_COOKIES") == "true")
+	// 4. Rate Limiter
+	rlCfg, err := ratelimit.ConfigFromEnv()
+	if err != nil {
+		logger.Error("Failed to load rate limiter config", "error", err)
+		os.Exit(1)
+	}
+	limiter, err := ratelimit.NewPostgresLimiter(pool)
+	if err != nil {
+		logger.Error("Failed to initialize rate limiter", "error", err)
+		os.Exit(1)
+	}
+	keyDeriver, err := ratelimit.NewKeyDeriver(rlCfg.HMACSecret)
+	if err != nil {
+		logger.Error("Failed to initialize rate limit key deriver", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("Rate limiter initialized")
+
+	// 5. Trusted proxy configuration for client IP extraction.
+	// TRUSTED_PROXIES is a comma-separated list of trusted proxy IPs or CIDRs (e.g. "10.0.0.0/8,172.16.0.1").
+	// When absent or empty, only RemoteAddr is used; forwarded headers are ignored entirely.
+	var ipExtractor *auth.IPExtractor
+	if rawProxies := os.Getenv("TRUSTED_PROXIES"); rawProxies != "" {
+		var entries []string
+		for _, e := range strings.Split(rawProxies, ",") {
+			if s := strings.TrimSpace(e); s != "" {
+				entries = append(entries, s)
+			}
+		}
+		extractor, extErr := auth.NewIPExtractor(entries)
+		if extErr != nil {
+			logger.Error("Invalid TRUSTED_PROXIES configuration", "error", extErr)
+			os.Exit(1)
+		}
+		ipExtractor = extractor
+		logger.Info("Trusted proxy configuration loaded", "count", len(entries))
+	} else {
+		var extErr error
+		ipExtractor, extErr = auth.NewIPExtractor(nil)
+		if extErr != nil {
+			logger.Error("Failed to initialize IP extractor", "error", extErr)
+			os.Exit(1)
+		}
+		logger.Info("No trusted proxies configured; using RemoteAddr for client IP")
+	}
+
+	authHandler := auth.NewHandler(
+		authService,
+		logger,
+		os.Getenv("SECURE_COOKIES") == "true",
+		auth.WithRateLimiter(limiter, keyDeriver),
+		auth.WithIPExtractor(ipExtractor),
+	)
 
 	mux := http.NewServeMux()
 	authHandler.RegisterRoutes(mux)

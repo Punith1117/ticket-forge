@@ -5,29 +5,64 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/Punith1117/ticket-forge/internal/ratelimit"
+	"github.com/Punith1117/ticket-forge/internal/security"
 )
 
 const maxRequestBodySize = 64 * 1024 // 64 KB
+
+// Option configures a Handler.
+type Option func(*Handler)
+
+// WithRateLimiter configures the rate limiter and key deriver for the handler.
+func WithRateLimiter(limiter ratelimit.Limiter, keyDeriver *ratelimit.KeyDeriver) Option {
+	return func(h *Handler) {
+		h.limiter = limiter
+		h.keyDeriver = keyDeriver
+	}
+}
+
+// WithIPExtractor configures the client IP extractor for the handler.
+func WithIPExtractor(extractor *IPExtractor) Option {
+	return func(h *Handler) {
+		h.ipExtractor = extractor
+	}
+}
 
 // Handler processes HTTP requests for user authentication and registration.
 type Handler struct {
 	service       *Service
 	logger        *slog.Logger
 	secureCookies bool
+	limiter       ratelimit.Limiter
+	keyDeriver    *ratelimit.KeyDeriver
+	ipExtractor   *IPExtractor
 }
 
 // NewHandler constructs a new auth Handler.
-func NewHandler(service *Service, logger *slog.Logger, secureCookies bool) *Handler {
+func NewHandler(service *Service, logger *slog.Logger, secureCookies bool, opts ...Option) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{
+	h := &Handler{
 		service:       service,
 		logger:        logger,
 		secureCookies: secureCookies,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	if h.ipExtractor == nil {
+		h.ipExtractor, _ = NewIPExtractor(nil)
+	}
+	return h
 }
 
 // RegisterRoutes mounts auth endpoints onto the provided ServeMux.
@@ -57,6 +92,27 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, errCode, message
 	})
 }
 
+// writeRateLimitError returns HTTP 429 Too Many Requests with a Retry-After header.
+func (h *Handler) writeRateLimitError(w http.ResponseWriter, retryAfter time.Duration) {
+	retrySeconds := int(math.Ceil(retryAfter.Seconds()))
+	if retrySeconds < 1 {
+		retrySeconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySeconds))
+	h.writeError(w, http.StatusTooManyRequests, "too_many_requests", "rate limit exceeded")
+}
+
+func (h *Handler) clientIP(r *http.Request) string {
+	if h.ipExtractor != nil {
+		return h.ipExtractor.ClientIP(r)
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil {
+		return host
+	}
+	return strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
+}
+
 // decodeJSON reads and strictly decodes a JSON request body with size limiting.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
@@ -82,7 +138,58 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.service.RequestRegistration(r.Context(), req.Email)
+	normEmail, err := NormalizeEmail(req.Email)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
+	// Rate limiting protections: evaluate both IP and email limits before generating tokens or challenge
+	if h.limiter != nil && h.keyDeriver != nil {
+		// 1. IP-based limit
+		clientIP := h.clientIP(r)
+		ipKey, err := h.keyDeriver.DeriveKey(PolicyRegisterIP.ID, ratelimit.DomainIP, clientIP)
+		if err != nil {
+			h.logger.Error("failed to derive register IP key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyRegisterIP)
+		if err != nil {
+			// Fail closed on database / infrastructure errors
+			h.logger.Error("register IP rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !ipRes.Allowed {
+			h.writeRateLimitError(w, ipRes.RetryAfter)
+			return
+		}
+
+		// 2. Normalized email limit
+		emailKey, err := h.keyDeriver.DeriveKey(PolicyRegisterEmail.ID, ratelimit.DomainEmail, normEmail)
+		if err != nil {
+			h.logger.Error("failed to derive register email key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		emailRes, err := h.limiter.Allow(r.Context(), emailKey, PolicyRegisterEmail)
+		if err != nil {
+			// Fail closed on database / infrastructure errors
+			h.logger.Error("register email rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !emailRes.Allowed {
+			h.writeRateLimitError(w, emailRes.RetryAfter)
+			return
+		}
+	}
+
+	// 3. Initiate challenge (enforces 60-second cooldown, user existence check, challenge + outbox insertion)
+	err = h.service.RequestRegistration(r.Context(), normEmail)
 	if err != nil {
 		if errors.Is(err, ErrInvalidEmail) {
 			h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -110,7 +217,59 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	user, err := h.service.CompleteRegistration(r.Context(), req.Token, req.Password, req.DisplayName)
+	rawToken := strings.TrimSpace(req.Token)
+	if rawToken == "" {
+		h.writeError(w, http.StatusBadRequest, "invalid_token", ErrInvalidToken.Error())
+		return
+	}
+
+	// Rate limiting protections: evaluate IP and token identifier limits before Argon2id hashing or DB update
+	if h.limiter != nil && h.keyDeriver != nil {
+		// 1. IP-based limit
+		clientIP := h.clientIP(r)
+		ipKey, err := h.keyDeriver.DeriveKey(PolicyRegisterCompleteIP.ID, ratelimit.DomainIP, clientIP)
+		if err != nil {
+			h.logger.Error("failed to derive register complete IP key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyRegisterCompleteIP)
+		if err != nil {
+			// Fail closed on database / infrastructure errors
+			h.logger.Error("register complete IP rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !ipRes.Allowed {
+			h.writeRateLimitError(w, ipRes.RetryAfter)
+			return
+		}
+
+		// 2. Token identifier limit (SHA-256 hash input to key deriver; raw token is never persisted)
+		tokenHash := security.HashToken(rawToken)
+		tokenKey, err := h.keyDeriver.DeriveKey(PolicyRegisterCompleteToken.ID, ratelimit.DomainToken, tokenHash)
+		if err != nil {
+			h.logger.Error("failed to derive register complete token key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		tokenRes, err := h.limiter.Allow(r.Context(), tokenKey, PolicyRegisterCompleteToken)
+		if err != nil {
+			// Fail closed on database / infrastructure errors
+			h.logger.Error("register complete token rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !tokenRes.Allowed {
+			h.writeRateLimitError(w, tokenRes.RetryAfter)
+			return
+		}
+	}
+
+	// 3. Complete registration
+	user, err := h.service.CompleteRegistration(r.Context(), rawToken, req.Password, req.DisplayName)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidToken):
@@ -153,18 +312,71 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. IP-based request limit (evaluated on EVERY login request before password verification)
+	if h.limiter != nil && h.keyDeriver != nil {
+		clientIP := h.clientIP(r)
+		ipKey, err := h.keyDeriver.DeriveKey(PolicyLoginIP.ID, ratelimit.DomainIP, clientIP)
+		if err != nil {
+			h.logger.Error("failed to derive login IP key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyLoginIP)
+		if err != nil {
+			// Fail closed on database / infrastructure errors
+			h.logger.Error("login IP rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !ipRes.Allowed {
+			h.writeRateLimitError(w, ipRes.RetryAfter)
+			return
+		}
+	}
+
+	// 2. Perform authentication attempt
 	rawToken, info, err := h.service.Login(r.Context(), req.Email, req.Password)
 	if err != nil {
 		if errors.Is(err, ErrInvalidCredentials) {
+			// Authentication failed. Evaluate email-based failed-attempt limit.
+			if h.limiter != nil && h.keyDeriver != nil {
+				normEmail, nErr := NormalizeEmail(req.Email)
+				if nErr != nil {
+					normEmail = strings.ToLower(strings.TrimSpace(req.Email))
+				}
+				emailKey, kErr := h.keyDeriver.DeriveKey(PolicyLoginEmailFailure.ID, ratelimit.DomainEmail, normEmail)
+				if kErr != nil {
+					h.logger.Error("failed to derive login email failure key", "error", kErr)
+					h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+					return
+				}
+
+				failRes, fErr := h.limiter.Allow(r.Context(), emailKey, PolicyLoginEmailFailure)
+				if fErr != nil {
+					// Fail closed on database / infrastructure errors
+					h.logger.Error("login email failure rate limit evaluation failed", "error", fErr)
+					h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+					return
+				}
+				if !failRes.Allowed {
+					// Bucket is depleted! Reject without consuming another failure token.
+					h.writeRateLimitError(w, failRes.RetryAfter)
+					return
+				}
+			}
+
+			// Failure token was consumed within capacity; return generic credentials error
 			h.writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
 			return
 		}
+
 		h.logger.Error("login failed with internal error", "error", err)
 		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
 		return
 	}
 
-	// Issue session cookie. Only reached after successful persistence.
+	// 3. Successful authentication: issue session cookie (no failure token consumed)
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    rawToken,
@@ -182,12 +394,9 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleLogout handles POST /api/v1/auth/logout.
-// Requires a valid authenticated session (enforced by RequireAuth).
-// Revokes the current session in the database and clears the session cookie.
 func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := UserFromContext(r.Context())
 	if !ok {
-		// Should never happen when wrapped with RequireAuth, but guard defensively.
 		h.writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 		return
 	}
@@ -198,8 +407,6 @@ func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Clear the session cookie by expiring it immediately.
-	// Cookie attributes must match those set at login to ensure the browser removes it.
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    "",
