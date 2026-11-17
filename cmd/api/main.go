@@ -14,6 +14,7 @@ import (
 	"github.com/Punith1117/ticket-forge/internal/auth"
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
+	"github.com/Punith1117/ticket-forge/internal/organizer"
 	"github.com/Punith1117/ticket-forge/internal/ratelimit"
 	"github.com/Punith1117/ticket-forge/internal/security"
 )
@@ -28,7 +29,7 @@ func main() {
 
 	logger.Info("TicketForge API starting...")
 
-	// 1. Database Connection Pool
+	// Database Connection Pool
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dbCancel()
 
@@ -41,7 +42,7 @@ func main() {
 	defer pool.Close()
 	logger.Info("Database connection pool established")
 
-	// 2. Token Encrypter (KeyRing)
+	// Token Encrypter (KeyRing)
 	encCfg := security.EncryptionConfigFromEnv()
 	keyRing, err := encCfg.BuildKeyRing()
 	if err != nil {
@@ -55,14 +56,14 @@ func main() {
 	}
 	logger.Info("Token encrypter initialized", "active_version", encrypter.ActiveKeyVersion())
 
-	// 3. Auth Service & Handlers
+	// Auth Service & Handlers
 	authService, err := auth.NewService(pool, encrypter)
 	if err != nil {
 		logger.Error("Failed to initialize auth service", "error", err)
 		os.Exit(1)
 	}
 
-	// 4. Rate Limiter
+	// Rate Limiter
 	rlCfg, err := ratelimit.ConfigFromEnv()
 	if err != nil {
 		logger.Error("Failed to load rate limiter config", "error", err)
@@ -80,7 +81,7 @@ func main() {
 	}
 	logger.Info("Rate limiter initialized")
 
-	// 5. Trusted proxy configuration for client IP extraction.
+	// Trusted proxy configuration for client IP extraction.
 	// TRUSTED_PROXIES is a comma-separated list of trusted proxy IPs or CIDRs (e.g. "10.0.0.0/8,172.16.0.1").
 	// When absent or empty, only RemoteAddr is used; forwarded headers are ignored entirely.
 	var ipExtractor *auth.IPExtractor
@@ -116,8 +117,18 @@ func main() {
 		auth.WithIPExtractor(ipExtractor),
 	)
 
+	// Organizer Service & Handler
+	organizerService, err := organizer.NewService(pool)
+	if err != nil {
+		logger.Error("Failed to initialize organizer service", "error", err)
+		os.Exit(1)
+	}
+
+	organizerHandler := organizer.NewHandler(organizerService, logger)
+
 	mux := http.NewServeMux()
 	authHandler.RegisterRoutes(mux)
+	organizerHandler.RegisterRoutes(mux, authHandler)
 
 	// Health check endpoint
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
