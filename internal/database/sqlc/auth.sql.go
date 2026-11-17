@@ -11,6 +11,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumePasswordResetToken = `-- name: ConsumePasswordResetToken :execrows
+UPDATE password_reset_tokens
+SET used_at = now()
+WHERE id = $1
+  AND used_at IS NULL
+`
+
+func (q *Queries) ConsumePasswordResetToken(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, consumePasswordResetToken, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const consumeRegistrationChallenge = `-- name: ConsumeRegistrationChallenge :execrows
 UPDATE registration_verification_challenges
 SET consumed_at = now()
@@ -24,6 +39,39 @@ func (q *Queries) ConsumeRegistrationChallenge(ctx context.Context, id pgtype.UU
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const createPasswordResetToken = `-- name: CreatePasswordResetToken :one
+INSERT INTO password_reset_tokens (
+    user_id,
+    token_hash,
+    expires_at
+) VALUES (
+    $1,
+    $2,
+    $3
+)
+RETURNING id, user_id, token_hash, expires_at, used_at, created_at
+`
+
+type CreatePasswordResetTokenParams struct {
+	UserID    pgtype.UUID        `db:"user_id" json:"user_id"`
+	TokenHash string             `db:"token_hash" json:"token_hash"`
+	ExpiresAt pgtype.Timestamptz `db:"expires_at" json:"expires_at"`
+}
+
+func (q *Queries) CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, createPasswordResetToken, arg.UserID, arg.TokenHash, arg.ExpiresAt)
+	var i PasswordResetToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.UsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const createRegistrationChallenge = `-- name: CreateRegistrationChallenge :one
@@ -102,6 +150,27 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 	return i, err
 }
 
+const getLatestPasswordResetTokenByUserID = `-- name: GetLatestPasswordResetTokenByUserID :one
+SELECT id, user_id, token_hash, expires_at, used_at, created_at FROM password_reset_tokens
+WHERE user_id = $1
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+func (q *Queries) GetLatestPasswordResetTokenByUserID(ctx context.Context, userID pgtype.UUID) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, getLatestPasswordResetTokenByUserID, userID)
+	var i PasswordResetToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.UsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getLatestRegistrationChallengeByEmail = `-- name: GetLatestRegistrationChallengeByEmail :one
 SELECT id, email, token_hash, expires_at, consumed_at, created_at FROM registration_verification_challenges
 WHERE email = lower(trim($1::text))
@@ -118,6 +187,26 @@ func (q *Queries) GetLatestRegistrationChallengeByEmail(ctx context.Context, ema
 		&i.TokenHash,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getPasswordResetTokenForUpdate = `-- name: GetPasswordResetTokenForUpdate :one
+SELECT id, user_id, token_hash, expires_at, used_at, created_at FROM password_reset_tokens
+WHERE token_hash = $1
+FOR UPDATE
+`
+
+func (q *Queries) GetPasswordResetTokenForUpdate(ctx context.Context, tokenHash string) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, getPasswordResetTokenForUpdate, tokenHash)
+	var i PasswordResetToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.ExpiresAt,
+		&i.UsedAt,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -163,6 +252,21 @@ func (q *Queries) GetSessionByTokenHash(ctx context.Context, tokenHash string) (
 		&i.RevokedAt,
 	)
 	return i, err
+}
+
+const revokeAllSessionsByUserID = `-- name: RevokeAllSessionsByUserID :execrows
+UPDATE sessions
+SET revoked_at = now()
+WHERE user_id = $1
+  AND revoked_at IS NULL
+`
+
+func (q *Queries) RevokeAllSessionsByUserID(ctx context.Context, userID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeAllSessionsByUserID, userID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const revokeSessionByID = `-- name: RevokeSessionByID :execrows

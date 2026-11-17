@@ -60,4 +60,40 @@ var (
 		RefillTokens:   1,
 		RefillInterval: 2 * time.Minute,
 	}
+
+	// PolicyPasswordResetIP limits password-reset requests per client IP.
+	// Capacity: 10, Refill: 1 token / 60 seconds.
+	PolicyPasswordResetIP = ratelimit.Policy{
+		ID:             "auth:password_reset:ip",
+		Capacity:       10,
+		RefillTokens:   1,
+		RefillInterval: 60 * time.Second,
+	}
+
+	// PolicyPasswordResetEmail limits password-reset requests per normalized email.
+	// Capacity: 3, Refill: 1 token / 10 minutes.
+	PolicyPasswordResetEmail = ratelimit.Policy{
+		ID:             "auth:password_reset:email",
+		Capacity:       3,
+		RefillTokens:   1,
+		RefillInterval: 10 * time.Minute,
+	}
+
+	// PolicyPasswordResetCompleteIP limits password-reset completion requests per client IP.
+	// Capacity: 20, Refill: 1 token / 30 seconds.
+	PolicyPasswordResetCompleteIP = ratelimit.Policy{
+		ID:             "auth:password_reset:complete:ip",
+		Capacity:       20,
+		RefillTokens:   1,
+		RefillInterval: 30 * time.Second,
+	}
+
+	// PolicyPasswordResetCompleteToken limits password-reset completion attempts per password-reset token.
+	// Capacity: 5, Refill: 1 token / 2 minutes.
+	PolicyPasswordResetCompleteToken = ratelimit.Policy{
+		ID:             "auth:password_reset:complete:token",
+		Capacity:       5,
+		RefillTokens:   1,
+		RefillInterval: 2 * time.Minute,
+	}
 )

@@ -10,10 +10,10 @@ import (
 // IPExtractor extracts client IP addresses from HTTP requests with strict proxy trust verification.
 //
 // Invariant:
-// 1. By default, RemoteAddr is always used.
-// 2. X-Forwarded-For and X-Real-IP are NEVER trusted unless the immediate connecting peer (RemoteAddr)
-//    is an explicitly configured trusted proxy.
-// 3. When trusted proxy configuration is absent, forwarded headers are completely ignored.
+//  1. By default, RemoteAddr is always used.
+//  2. X-Forwarded-For and X-Real-IP are NEVER trusted unless the immediate connecting peer (RemoteAddr)
+//     is an explicitly configured trusted proxy.
+//  3. When trusted proxy configuration is absent, forwarded headers are completely ignored.
 type IPExtractor struct {
 	trustedNets []*net.IPNet
 }

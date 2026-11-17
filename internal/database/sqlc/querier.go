@@ -13,8 +13,10 @@ import (
 type Querier interface {
 	ClaimOutboxEvents(ctx context.Context, arg ClaimOutboxEventsParams) ([]OutboxEvent, error)
 	CompleteOutboxEvent(ctx context.Context, arg CompleteOutboxEventParams) (int64, error)
+	ConsumePasswordResetToken(ctx context.Context, id pgtype.UUID) (int64, error)
 	ConsumeRegistrationChallenge(ctx context.Context, id pgtype.UUID) (int64, error)
 	CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error)
+	CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error)
 	CreateRegistrationChallenge(ctx context.Context, arg CreateRegistrationChallengeParams) (RegistrationVerificationChallenge, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
@@ -22,7 +24,9 @@ type Querier interface {
 	DeleteInactiveBuckets(ctx context.Context, arg DeleteInactiveBucketsParams) (int64, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) (int64, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
+	GetLatestPasswordResetTokenByUserID(ctx context.Context, userID pgtype.UUID) (PasswordResetToken, error)
 	GetLatestRegistrationChallengeByEmail(ctx context.Context, email string) (RegistrationVerificationChallenge, error)
+	GetPasswordResetTokenForUpdate(ctx context.Context, tokenHash string) (PasswordResetToken, error)
 	GetRateLimitBucket(ctx context.Context, key string) (RateLimitBucket, error)
 	GetRateLimitBucketForUpdate(ctx context.Context, key string) (GetRateLimitBucketForUpdateRow, error)
 	GetRegistrationChallengeForUpdate(ctx context.Context, tokenHash string) (RegistrationVerificationChallenge, error)
@@ -36,8 +40,10 @@ type Querier interface {
 	ListActiveVenues(ctx context.Context) ([]Venue, error)
 	ListEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error)
 	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)
+	RevokeAllSessionsByUserID(ctx context.Context, userID pgtype.UUID) (int64, error)
 	RevokeSessionByID(ctx context.Context, id pgtype.UUID) (int64, error)
 	UpdateRateLimitBucket(ctx context.Context, arg UpdateRateLimitBucketParams) (int64, error)
+	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error)
 	ValidateAndRefreshSession(ctx context.Context, arg ValidateAndRefreshSessionParams) (Session, error)
 }
 

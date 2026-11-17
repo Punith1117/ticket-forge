@@ -15,3 +15,11 @@ INSERT INTO users (
     lower(trim(@email::text)), @password_hash, @display_name
 )
 RETURNING *;
+
+-- name: UpdateUserPassword :one
+UPDATE users
+SET password_hash = @password_hash,
+    updated_at = now()
+WHERE id = @id
+RETURNING *;
+

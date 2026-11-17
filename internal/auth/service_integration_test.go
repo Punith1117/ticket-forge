@@ -44,6 +44,8 @@ func setupIntegrationDB(t *testing.T) (*pgxpool.Pool, *auth.Service, *security.T
 
 	// Clean test tables
 	_, err = pool.Exec(ctx, `
+		DELETE FROM password_reset_tokens;
+		DELETE FROM sessions;
 		DELETE FROM users;
 		DELETE FROM registration_verification_challenges;
 		DELETE FROM outbox_events;

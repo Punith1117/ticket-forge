@@ -220,7 +220,7 @@ func TestHandler_Login_CorrectCredentials_BypassFailureBucket(t *testing.T) {
 	// IP bucket allows (call 0). Failure bucket would deny (call 1) if reached.
 	// If correct credentials succeed, the failure-bucket Allow should never be called.
 	stub := &stubLimiter{responses: []stubResult{
-		allowResult(),  // IP bucket – allowed
+		allowResult(),                // IP bucket – allowed
 		denyResult(60 * time.Second), // failure bucket – denied (should NOT be reached on success)
 	}}
 	kd := newTestKeyDeriver(t)
@@ -268,7 +268,7 @@ func TestHandler_Login_ExhaustedFailureBucket_WrongCredentials_Returns429(t *tes
 
 	// IP bucket allows (call 0). Failure bucket is depleted (call 1).
 	stub := &stubLimiter{responses: []stubResult{
-		allowResult(),               // IP check – allowed
+		allowResult(),                // IP check – allowed
 		denyResult(30 * time.Second), // failure bucket – depleted
 	}}
 	kd := newTestKeyDeriver(t)
@@ -313,7 +313,7 @@ func TestHandler_Login_CallsIPBucketBeforeAuth(t *testing.T) {
 func TestHandler_Register_CallsIPThenEmailBucket(t *testing.T) {
 	// Allow IP, deny email bucket.
 	stub := &stubLimiter{responses: []stubResult{
-		allowResult(),              // IP bucket
+		allowResult(),               // IP bucket
 		denyResult(5 * time.Second), // email bucket
 	}}
 	h := newHandlerWithStub(t, stub)
@@ -332,7 +332,7 @@ func TestHandler_Register_CallsIPThenEmailBucket(t *testing.T) {
 func TestHandler_RegisterComplete_CallsIPThenTokenBucket(t *testing.T) {
 	// Allow IP, deny token bucket.
 	stub := &stubLimiter{responses: []stubResult{
-		allowResult(),              // IP bucket
+		allowResult(),               // IP bucket
 		denyResult(5 * time.Second), // token bucket
 	}}
 	h := newHandlerWithStub(t, stub)
@@ -547,6 +547,10 @@ func TestPolicies_MatchADR020(t *testing.T) {
 		{"RegisterEmail", auth.PolicyRegisterEmail, 3, 1, 10 * time.Minute},
 		{"RegisterCompleteIP", auth.PolicyRegisterCompleteIP, 20, 1, 10 * time.Second},
 		{"RegisterCompleteToken", auth.PolicyRegisterCompleteToken, 5, 1, 2 * time.Minute},
+		{"PasswordResetIP", auth.PolicyPasswordResetIP, 10, 1, 60 * time.Second},
+		{"PasswordResetEmail", auth.PolicyPasswordResetEmail, 3, 1, 10 * time.Minute},
+		{"PasswordResetCompleteIP", auth.PolicyPasswordResetCompleteIP, 20, 1, 30 * time.Second},
+		{"PasswordResetCompleteToken", auth.PolicyPasswordResetCompleteToken, 5, 1, 2 * time.Minute},
 	}
 
 	for _, tc := range policies {

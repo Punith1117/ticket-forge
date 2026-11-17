@@ -44,6 +44,27 @@ type LoginResponse struct {
 	Message string `json:"message"`
 }
 
+// PasswordResetRequest holds the payload for initiating a password reset.
+type PasswordResetRequest struct {
+	Email string `json:"email"`
+}
+
+// PasswordResetResponse represents the generic response returned on password reset request.
+type PasswordResetResponse struct {
+	Message string `json:"message"`
+}
+
+// PasswordResetCompleteRequest holds the payload for finalizing password reset.
+type PasswordResetCompleteRequest struct {
+	Token    string `json:"token"`
+	Password string `json:"password"`
+}
+
+// PasswordResetCompleteResponse represents the response on successful password reset completion.
+type PasswordResetCompleteResponse struct {
+	Message string `json:"message"`
+}
+
 // SessionInfo holds details of a created session (for internal use and testing).
 type SessionInfo struct {
 	SessionID         string

@@ -26,6 +26,9 @@ const (
 	// DefaultTokenExpiry is the lifetime of a registration verification token.
 	DefaultTokenExpiry = 24 * time.Hour
 
+	// DefaultPasswordResetTokenExpiry is the lifetime of a password reset token per ADR-013.
+	DefaultPasswordResetTokenExpiry = 20 * time.Minute
+
 	// SessionIdleTimeout is the idle session timeout per ADR-012.
 	SessionIdleTimeout = 30 * time.Minute
 
@@ -57,6 +60,7 @@ type Service struct {
 	encrypter   *security.TokenEncrypter
 	cooldown    time.Duration
 	tokenExpiry time.Duration
+	resetExpiry time.Duration
 }
 
 // NewService constructs a new auth Service.
@@ -74,6 +78,7 @@ func NewService(pool *pgxpool.Pool, encrypter *security.TokenEncrypter) (*Servic
 		encrypter:   encrypter,
 		cooldown:    DefaultCooldownDuration,
 		tokenExpiry: DefaultTokenExpiry,
+		resetExpiry: DefaultPasswordResetTokenExpiry,
 	}, nil
 }
 
@@ -85,6 +90,11 @@ func (s *Service) SetCooldown(d time.Duration) {
 // SetTokenExpiry sets the token expiration lifetime (useful for testing).
 func (s *Service) SetTokenExpiry(d time.Duration) {
 	s.tokenExpiry = d
+}
+
+// SetPasswordResetTokenExpiry sets the password reset token expiration lifetime (useful for testing).
+func (s *Service) SetPasswordResetTokenExpiry(d time.Duration) {
+	s.resetExpiry = d
 }
 
 // NormalizeEmail cleans and validates an email address.
@@ -446,4 +456,189 @@ func (s *Service) Login(ctx context.Context, email, password string) (rawToken s
 		UserID:            uuidString(user.ID),
 		AbsoluteExpiresAt: absoluteExpiresAt,
 	}, nil
+}
+
+// RequestPasswordReset initiates the password reset flow for an existing user account.
+// Operates inside an atomic database transaction and guarantees:
+// - Non-leaking generic responses regardless of whether the account exists.
+// - 60s cooldown enforcement via PostgreSQL advisory transaction locks.
+// - Tokens are only generated for existing accounts.
+// - Atomically writes password reset token and transactional outbox event.
+func (s *Service) RequestPasswordReset(ctx context.Context, email string) error {
+	normalizedEmail, err := NormalizeEmail(email)
+	if err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("auth: failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := s.queries.WithTx(tx)
+
+	// Serialize concurrent requests for the same email using transaction-scoped advisory locks.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('password_reset:' || $1::text))", normalizedEmail); err != nil {
+		return fmt.Errorf("auth: failed to acquire advisory lock: %w", err)
+	}
+
+	// 1. Check if user exists
+	user, err := qtx.GetUserByEmail(ctx, normalizedEmail)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Nonexistent account: do not issue token or outbox event, but commit and return generic success
+			return tx.Commit(ctx)
+		}
+		return fmt.Errorf("auth: failed to query user: %w", err)
+	}
+
+	// 2. Check 60-second cooldown against the most recent password reset token for this user
+	latest, err := qtx.GetLatestPasswordResetTokenByUserID(ctx, user.ID)
+	if err == nil {
+		if time.Since(latest.CreatedAt.Time) < s.cooldown {
+			return ErrCooldownActive
+		}
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("auth: failed to query latest password reset token: %w", err)
+	}
+
+	// 3. Generate token (256 bits entropy), SHA-256 hash, and AES-256-GCM ciphertext
+	rawToken, err := security.GenerateToken()
+	if err != nil {
+		return fmt.Errorf("auth: failed to generate token: %w", err)
+	}
+
+	tokenHash := security.HashToken(rawToken)
+	encryptedToken, err := s.encrypter.EncryptToken(rawToken, []byte(security.PurposePasswordReset))
+	if err != nil {
+		return fmt.Errorf("auth: failed to encrypt token: %w", err)
+	}
+
+	// 4. Create password reset token record
+	expiresAt := time.Now().UTC().Add(s.resetExpiry)
+	resetToken, err := qtx.CreatePasswordResetToken(ctx, sqlc.CreatePasswordResetTokenParams{
+		UserID:    user.ID,
+		TokenHash: tokenHash,
+		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("auth: failed to create password reset token: %w", err)
+	}
+
+	// 5. Create outbox event in the same transaction
+	payloadBytes, err := json.Marshal(outbox.EmailEventPayload{
+		Recipient:      normalizedEmail,
+		EncryptedToken: encryptedToken,
+		TokenExpiresAt: expiresAt,
+	})
+	if err != nil {
+		return fmt.Errorf("auth: failed to marshal outbox payload: %w", err)
+	}
+
+	_, err = qtx.InsertOutboxEvent(ctx, sqlc.InsertOutboxEventParams{
+		AggregateType: "password_reset",
+		AggregateID:   resetToken.ID,
+		EventType:     outbox.EventTypePasswordReset,
+		Payload:       payloadBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("auth: failed to insert outbox event: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("auth: failed to commit password reset request: %w", err)
+	}
+
+	return nil
+}
+
+// CompletePasswordReset verifies the reset token, updates the password with Argon2id,
+// marks the token consumed, and revokes all active sessions for the user within a single atomic transaction.
+func (s *Service) CompletePasswordReset(ctx context.Context, token string, newPassword string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return ErrInvalidToken
+	}
+
+	if err := security.ValidatePasswordStrength(newPassword); err != nil {
+		return ErrInvalidPassword
+	}
+
+	tokenHash := security.HashToken(token)
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("auth: failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	qtx := s.queries.WithTx(tx)
+
+	// 1. Lock and validate password reset token using FOR UPDATE
+	resetToken, err := qtx.GetPasswordResetTokenForUpdate(ctx, tokenHash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidToken
+		}
+		return fmt.Errorf("auth: failed to fetch password reset token: %w", err)
+	}
+
+	if resetToken.UsedAt.Valid {
+		return ErrTokenAlreadyConsumed
+	}
+
+	if time.Now().UTC().After(resetToken.ExpiresAt.Time.UTC()) {
+		return ErrTokenExpired
+	}
+
+	// 2. Lock user update via transaction advisory lock
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('user_password_update:' || $1::text))", uuidString(resetToken.UserID)); err != nil {
+		return fmt.Errorf("auth: failed to acquire password update lock: %w", err)
+	}
+
+	// 3. Verify user still exists
+	user, err := qtx.GetUserByID(ctx, resetToken.UserID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidToken
+		}
+		return fmt.Errorf("auth: failed to query user: %w", err)
+	}
+
+	// 4. Hash new password with Argon2id
+	newHash, err := security.HashPassword(newPassword)
+	if err != nil {
+		return fmt.Errorf("auth: failed to hash new password: %w", err)
+	}
+
+	// 5. Update password
+	_, err = qtx.UpdateUserPassword(ctx, sqlc.UpdateUserPasswordParams{
+		ID:           user.ID,
+		PasswordHash: newHash,
+	})
+	if err != nil {
+		return fmt.Errorf("auth: failed to update user password: %w", err)
+	}
+
+	// 6. Consume token atomically
+	rowsAffected, err := qtx.ConsumePasswordResetToken(ctx, resetToken.ID)
+	if err != nil {
+		return fmt.Errorf("auth: failed to consume reset token: %w", err)
+	}
+	if rowsAffected == 0 {
+		return ErrTokenAlreadyConsumed
+	}
+
+	// 7. Revoke ALL existing active sessions for this user
+	_, err = qtx.RevokeAllSessionsByUserID(ctx, user.ID)
+	if err != nil {
+		return fmt.Errorf("auth: failed to revoke user sessions: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("auth: failed to commit password reset completion: %w", err)
+	}
+
+	return nil
 }

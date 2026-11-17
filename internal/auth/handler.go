@@ -71,6 +71,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/register/complete", h.HandleRegisterComplete)
 	mux.HandleFunc("POST /api/v1/auth/login", h.HandleLogin)
 	mux.HandleFunc("POST /api/v1/auth/logout", h.RequireAuth(h.HandleLogout))
+	mux.HandleFunc("POST /api/v1/auth/password-reset/request", h.HandlePasswordResetRequest)
+	mux.HandleFunc("POST /api/v1/auth/password-reset/complete", h.HandlePasswordResetComplete)
 }
 
 // ErrorResponse defines the standard JSON error schema.
@@ -421,4 +423,171 @@ func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, struct {
 		Message string `json:"message"`
 	}{Message: "Logged out successfully."})
+}
+
+// HandlePasswordResetRequest handles POST /api/v1/auth/password-reset/request.
+func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
+	var req PasswordResetRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		return
+	}
+
+	normEmail, err := NormalizeEmail(req.Email)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
+	// Rate limiting protections: evaluate both IP and email limits before DB lookup
+	if h.limiter != nil && h.keyDeriver != nil {
+		// 1. IP-based limit
+		clientIP := h.clientIP(r)
+		ipKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetIP.ID, ratelimit.DomainIP, clientIP)
+		if err != nil {
+			h.logger.Error("failed to derive password reset IP key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyPasswordResetIP)
+		if err != nil {
+			h.logger.Error("password reset IP rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !ipRes.Allowed {
+			h.writeRateLimitError(w, ipRes.RetryAfter)
+			return
+		}
+
+		// 2. Normalized email limit
+		emailKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetEmail.ID, ratelimit.DomainEmail, normEmail)
+		if err != nil {
+			h.logger.Error("failed to derive password reset email key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		emailRes, err := h.limiter.Allow(r.Context(), emailKey, PolicyPasswordResetEmail)
+		if err != nil {
+			h.logger.Error("password reset email rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !emailRes.Allowed {
+			h.writeRateLimitError(w, emailRes.RetryAfter)
+			return
+		}
+	}
+
+	// 3. Request password reset (cooldown enforcement, user check, challenge + outbox insertion)
+	err = h.service.RequestPasswordReset(r.Context(), normEmail)
+	if err != nil {
+		if errors.Is(err, ErrInvalidEmail) {
+			h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		if errors.Is(err, ErrCooldownActive) {
+			// Per ADR-020: Return the generic response in cooldown situations to prevent account enumeration.
+			h.writeJSON(w, http.StatusAccepted, PasswordResetResponse{
+				Message: "If an account exists for this email address, a password reset link has been sent.",
+			})
+			return
+		}
+		h.logger.Error("failed to process password reset request", "error", err)
+		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+		return
+	}
+
+	h.writeJSON(w, http.StatusAccepted, PasswordResetResponse{
+		Message: "If an account exists for this email address, a password reset link has been sent.",
+	})
+}
+
+// HandlePasswordResetComplete handles POST /api/v1/auth/password-reset/complete.
+func (h *Handler) HandlePasswordResetComplete(w http.ResponseWriter, r *http.Request) {
+	var req PasswordResetCompleteRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		return
+	}
+
+	rawToken := strings.TrimSpace(req.Token)
+	if rawToken == "" {
+		h.writeError(w, http.StatusBadRequest, "invalid_token", ErrInvalidToken.Error())
+		return
+	}
+
+	// Password strength is validated before rate limiting or DB access to avoid burning tokens on malformed requests
+	if err := security.ValidatePasswordStrength(req.Password); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+		return
+	}
+
+	// Rate limiting protections: evaluate IP and token identifier limits before Argon2id hashing or DB update
+	if h.limiter != nil && h.keyDeriver != nil {
+		// 1. IP-based limit
+		clientIP := h.clientIP(r)
+		ipKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetCompleteIP.ID, ratelimit.DomainIP, clientIP)
+		if err != nil {
+			h.logger.Error("failed to derive password reset complete IP key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyPasswordResetCompleteIP)
+		if err != nil {
+			h.logger.Error("password reset complete IP rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !ipRes.Allowed {
+			h.writeRateLimitError(w, ipRes.RetryAfter)
+			return
+		}
+
+		// 2. Token identifier limit (SHA-256 hash input to key deriver)
+		tokenHash := security.HashToken(rawToken)
+		tokenKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetCompleteToken.ID, ratelimit.DomainToken, tokenHash)
+		if err != nil {
+			h.logger.Error("failed to derive password reset complete token key", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+
+		tokenRes, err := h.limiter.Allow(r.Context(), tokenKey, PolicyPasswordResetCompleteToken)
+		if err != nil {
+			h.logger.Error("password reset complete token rate limit evaluation failed", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			return
+		}
+		if !tokenRes.Allowed {
+			h.writeRateLimitError(w, tokenRes.RetryAfter)
+			return
+		}
+	}
+
+	// 3. Complete password reset
+	err := h.service.CompletePasswordReset(r.Context(), rawToken, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidToken):
+			h.writeError(w, http.StatusBadRequest, "invalid_token", err.Error())
+		case errors.Is(err, ErrTokenExpired):
+			h.writeError(w, http.StatusBadRequest, "token_expired", err.Error())
+		case errors.Is(err, ErrTokenAlreadyConsumed):
+			h.writeError(w, http.StatusBadRequest, "token_already_used", err.Error())
+		case errors.Is(err, ErrInvalidPassword):
+			h.writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+		default:
+			h.logger.Error("failed to complete password reset", "error", err)
+			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+		}
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, PasswordResetCompleteResponse{
+		Message: "Password reset completed successfully. Please log in with your new password.",
+	})
 }

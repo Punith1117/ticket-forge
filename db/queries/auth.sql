@@ -62,3 +62,39 @@ UPDATE sessions
 SET revoked_at = now()
 WHERE id         = @id
   AND revoked_at IS NULL;
+
+-- name: CreatePasswordResetToken :one
+INSERT INTO password_reset_tokens (
+    user_id,
+    token_hash,
+    expires_at
+) VALUES (
+    @user_id,
+    @token_hash,
+    @expires_at
+)
+RETURNING *;
+
+-- name: GetLatestPasswordResetTokenByUserID :one
+SELECT * FROM password_reset_tokens
+WHERE user_id = @user_id
+ORDER BY created_at DESC
+LIMIT 1;
+
+-- name: GetPasswordResetTokenForUpdate :one
+SELECT * FROM password_reset_tokens
+WHERE token_hash = @token_hash
+FOR UPDATE;
+
+-- name: ConsumePasswordResetToken :execrows
+UPDATE password_reset_tokens
+SET used_at = now()
+WHERE id = @id
+  AND used_at IS NULL;
+
+-- name: RevokeAllSessionsByUserID :execrows
+UPDATE sessions
+SET revoked_at = now()
+WHERE user_id = @user_id
+  AND revoked_at IS NULL;
+
