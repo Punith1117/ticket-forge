@@ -1,7 +1,7 @@
 # ADR-020: Authentication Rate Limiting and Abuse Protection
 
 - **Status:** Accepted
-- **Date:** 2026-11-16
+- **Date:** 2026-11-17
 - **Related ADRs:** ADR-012 (Authentication and Sessions), ADR-013 (Email Verification and Delivery), ADR-019 (Application Rate Limiting Infrastructure)
 
 ## Context
@@ -13,7 +13,9 @@ Authentication endpoints are attractive targets for automated abuse, including:
 - Registration email bombing.
 - Automated registration attempts.
 - Repeated registration verification attempts using guessed or stolen tokens.
-- Excessive requests that consume server resources, particularly Argon2id password verification.
+- Password-reset email bombing.
+- Automated password-reset token guessing.
+- Excessive requests that consume server resources, particularly Argon2id password verification and hashing.
 
 ADR-019 establishes reusable application-level rate-limiting infrastructure using a PostgreSQL-backed token bucket.
 
@@ -51,8 +53,10 @@ The following endpoints must be protected:
 | `POST /api/v1/auth/register` | Normalized email | Every request |
 | `POST /api/v1/auth/register/complete` | IP address | Every request |
 | `POST /api/v1/auth/register/complete` | Registration token identifier | Every completion attempt |
-
-Additional authentication endpoints, including password reset, must define their own policies before implementation.
+| `POST /api/v1/auth/password-reset/request` | IP address | Every request |
+| `POST /api/v1/auth/password-reset/request` | Normalized email | Every request |
+| `POST /api/v1/auth/password-reset/complete` | IP address | Every request |
+| `POST /api/v1/auth/password-reset/complete` | Password-reset token identifier | Every completion attempt |
 
 ### Initial rate-limit policies
 
@@ -66,6 +70,10 @@ The following values are initial MVP defaults. They should be centralized in aut
 | Registration per email | 3 | 1 token every 10 minutes | Every registration request |
 | Registration completion per IP | 20 | 1 token every 10 seconds | Every completion request |
 | Registration completion per token | 5 | 1 token every 2 minutes | Every completion attempt |
+| Password-reset request per IP | 10 | 1 token every 60 seconds | Every password-reset request |
+| Password-reset request per email | 3 | 1 token every 10 minutes | Every password-reset request |
+| Password-reset completion per IP | 20 | 1 token every 30 seconds | Every password-reset completion request |
+| Password-reset completion per token | 5 | 1 token every 2 minutes | Every password-reset completion attempt |
 
 A token bucket starts with its configured capacity when a bucket is first created. Subsequent requests consume tokens, while elapsed time replenishes them according to the configured refill rate, subject to the capacity.
 
@@ -144,6 +152,55 @@ A request rejected by rate limiting must not consume, invalidate, or otherwise m
 
 The existing token validation, expiration, single-use, and transactional account-creation guarantees defined by ADR-013 must remain unchanged.
 
+### Password-reset request protection
+
+Password-reset requests must be limited independently by IP address and normalized email address.
+
+The IP-based limit constrains automated password-reset traffic originating from a single source.
+
+The email-based limit protects an individual email address against repeated password-reset requests, including attempts originating from multiple IP addresses.
+
+The existing 60-second password-reset request cooldown defined by ADR-013 remains in effect. The rate limiter supplements this cooldown rather than replacing it.
+
+Both rate-limit dimensions must be evaluated before generating a password-reset token or creating an outbox event.
+
+The request handler must preserve account-enumeration protection:
+
+- Existing and nonexistent email addresses must receive the same generic response.
+- A request must not disclose whether an account exists.
+- Cooldown and eligibility behavior must not expose account existence through different response bodies or status codes.
+
+A request rejected by rate limiting must not:
+
+- Generate a password-reset token.
+- Create a password-reset challenge.
+- Create an email outbox event.
+
+The email-specific bucket must be based on the normalized email address, not a user ID. This ensures the same identifier is used regardless of whether an account exists.
+
+### Password-reset completion protection
+
+Password-reset completion must be protected independently by IP address and password-reset token identifier.
+
+The IP-based limit reduces automated completion attempts from a single source.
+
+The token-based limit restricts repeated attempts against an individual password-reset challenge.
+
+The token identifier must be derived using a secure, non-reversible representation of the submitted token. The raw token must never be stored in rate-limiting records or used directly as a persisted bucket key.
+
+The rate-limit checks must occur before expensive Argon2id password hashing and before consuming or modifying a password-reset challenge.
+
+A request rejected by rate limiting must not:
+
+- Consume or invalidate the reset token.
+- Modify the user's password.
+- Revoke any existing sessions.
+- Otherwise modify password-reset state.
+
+The existing token validation, 20-minute expiration, single-use, and transactional password-update guarantees defined by ADR-013 must remain unchanged.
+
+A password-reset token must never be accepted as a registration verification token, and a registration verification token must never be accepted for password reset.
+
 ### Client IP identification and trusted proxies
 
 The server must use the remote address from the incoming network connection as the default client IP identifier.
@@ -156,7 +213,7 @@ When trusted proxy configuration is absent, the application must use the connect
 
 Proxy trust configuration must be explicit and documented for deployment environments.
 
-### 8. Rate-limit rejection responses
+### Rate-limit rejection responses
 
 When a request is rejected because a required rate limit is exhausted, the API must return:
 
@@ -199,7 +256,7 @@ The initial policy values should be revisited if legitimate shared-network traff
 
 Authentication rate-limit identifiers must follow the privacy requirements established by ADR-019.
 
-Normalized email addresses and registration token identifiers must not be stored in plaintext as bucket keys.
+Normalized email addresses and registration and password-reset token identifiers must not be stored in plaintext as bucket keys.
 
 Use the dedicated keyed HMAC mechanism defined by ADR-019 for sensitive identifiers.
 
@@ -226,6 +283,8 @@ Any future policy changes should consider the effects on legitimate users, abuse
 - Provides independent protection against attacks distributed across IP addresses.
 - Reduces registration email bombing.
 - Protects registration completion tokens from repeated guessing attempts.
+- Reduces password-reset email bombing.
+- Protects password-reset challenges against repeated token guessing.
 - Avoids permanent account lockout caused by failed login attempts.
 - Supports users sharing public IP addresses.
 - Reuses the generic infrastructure from ADR-019 without coupling it to authentication-specific behavior.
@@ -243,7 +302,6 @@ Any future policy changes should consider the effects on legitimate users, abuse
 
 The following are not included in this ADR:
 
-- Password reset rate limiting. This will be defined when password reset is implemented.
 - Logout and session revocation rate limiting.
 - OAuth or social authentication.
 - Multi-factor authentication.
@@ -264,7 +322,7 @@ The implementation should:
 5. Use normalized email identifiers and secure token identifiers.
 6. Respect trusted proxy configuration when determining client IP addresses.
 7. Return consistent `429` responses with appropriate `Retry-After` headers.
-8. Preserve existing authentication and registration transaction guarantees.
+8. Preserve existing authentication, registration, and password-reset transaction guarantees.
 9. Avoid logging sensitive identifiers or credentials.
 10. Include unit, PostgreSQL integration, concurrency, and HTTP handler tests.
 
