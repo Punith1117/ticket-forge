@@ -9,28 +9,26 @@ Organizers may occasionally need to change an event's scheduled time or venue.
 
 However, rescheduling after customers have confirmed bookings can create significant operational and customer-impact consequences.
 
-Rescheduling must also preserve venue scheduling constraints and avoid races with payment confirmation and reservation creation.
+The system separates event information from venue scheduling:
+
+- A `venue_booking` reserves a physical venue and time interval.
+- An `event` is organized using a venue booking and does not directly own its venue or schedule.
+
+Rescheduling must therefore account for both the event's booking history and the associated venue booking.
+
+The policy should preserve organizer flexibility before customers have committed to attending while protecting customers once bookings have been confirmed.
 
 ## Decision
 
-### Rescheduling before confirmed bookings
+### Rescheduling eligibility
 
-An organizer may reschedule an event while it has never had a confirmed booking.
+An event may be rescheduled only if:
 
-The new schedule must satisfy all event scheduling rules in ADR-015:
+- It has never had a confirmed booking.
+- It has no valid, unexpired Held reservations.
+- It has not been cancelled.
 
-- Start time must be at least 15 minutes in the future.
-- Start time must be no more than one calendar year in the future.
-- Duration must be at least 15 minutes.
-- Duration must not exceed 7 days.
-- The destination venue must be active.
-- The new interval must not overlap another active event at the destination venue.
-
-The same rules apply whether the organizer changes the time, the venue, or both.
-
-### Rescheduling after confirmed bookings
-
-Rescheduling is permanently prohibited once the event has had its first confirmed booking.
+Once an event has had its first confirmed booking, rescheduling is permanently prohibited.
 
 This remains true even if that booking is later refunded or otherwise no longer active.
 
@@ -38,32 +36,46 @@ The system must preserve the fact that a confirmed booking has existed. It must 
 
 ### Rescheduling while Held reservations exist
 
-Rescheduling is also prohibited while the event has any valid, unexpired Held reservations.
-
-This avoids changing the event schedule while customers are actively completing checkout.
+Rescheduling is prohibited while the event has any valid, unexpired Held reservations.
 
 Once all Held reservations have expired or otherwise been invalidated, rescheduling may proceed if the event has never had a confirmed booking.
 
+### Venue booking and schedule ownership
+
+The event does not directly own its venue or scheduled time. These belong to its associated venue booking.
+
+Consequently, rescheduling an event requires changing its associated venue booking or otherwise establishing a new venue booking for the rescheduled event.
+
+The venue booking must continue to satisfy the scheduling and venue availability rules defined in ADR-007 and ADR-015.
+
+The exact lifecycle and reassignment behavior of venue bookings during event rescheduling must be defined when rescheduling is brought into implementation scope.
+
 ### Venue activation
 
-The destination venue must be active.
+Any destination venue must be active.
 
-An inactive venue cannot be selected for rescheduling.
+An inactive venue cannot be selected for rescheduling. If an organizer needs to use an inactive venue, the platform must reactivate it first.
 
-If an organizer needs to move an event to an inactive venue, the platform must reactivate that venue first.
+### MVP scope
+
+Event rescheduling is not supported in the MVP.
+
+Venue bookings cannot be modified or rescheduled after creation. Organizers may cancel an event under ADR-010 and may cancel its associated venue booking only when no active event remains associated with it.
+
+The rescheduling policy defined in this ADR is retained as the intended product behavior for a future implementation. Supporting it will require revisiting venue-booking immutability and defining the associated transactional and lifecycle behavior.
 
 ### Atomic rescheduling
 
-Rescheduling must be performed in a database transaction.
+When implemented, rescheduling must be performed in a database transaction.
 
 The transaction must:
 
 1. Verify that the event is active.
 2. Verify that no confirmed booking has ever existed.
 3. Verify that no valid Held reservation exists.
-4. Validate the new time and duration.
+4. Validate the proposed schedule and duration.
 5. Verify that the destination venue is active.
-6. Apply the new venue and schedule.
+6. Apply the venue-booking changes required by the rescheduling operation.
 7. Allow the database exclusion constraint to enforce venue availability.
 
 If any condition fails, the entire operation must be rolled back.
@@ -72,7 +84,7 @@ An application-level availability check is not sufficient to prevent concurrent 
 
 ### Coordination with reservation and payment operations
 
-Rescheduling must be coordinated with reservation creation and payment confirmation.
+When implemented, rescheduling must be coordinated with reservation creation and payment confirmation.
 
 The implementation must use a consistent transaction and row-locking strategy so that:
 
@@ -94,16 +106,19 @@ A cancelled event cannot be rescheduled or reactivated. A replacement event must
 
 ### Positive
 
-- Customers with confirmed bookings are not exposed to organizer-initiated schedule changes in the MVP.
+- Customers with confirmed bookings are not exposed to organizer-initiated schedule changes.
 - Existing Held reservations are not disrupted by rescheduling.
+- Organizers retain the ability to reschedule events before customers have committed to attending.
 - Historical booking information remains meaningful.
 - Database-level venue conflict enforcement protects against concurrent scheduling operations.
+- The policy is established without expanding MVP implementation scope.
 
 ### Negative
 
-- Organizers cannot correct the schedule after the first confirmed booking, even if the change is minor.
+- Organizers cannot correct an event's schedule after the first confirmed booking, even if the change is minor.
 - Organizers must wait for valid Held reservations to expire before rescheduling.
-- The application must coordinate rescheduling with reservation and payment operations through transactions and locking.
+- The application will require additional transactional coordination between event, venue booking, reservation, and payment operations when rescheduling is implemented.
+- Rescheduling is unavailable in the MVP, so organizers must use cancellation and replacement workflows when a schedule change is necessary.
 
 ## Alternatives considered
 
@@ -117,4 +132,8 @@ Rejected because a booking that was previously confirmed and later refunded woul
 
 ### Allow rescheduling while Held reservations exist
 
-Rejected because customers may be actively completing checkout against the old event schedule.
+Rejected because customers may be actively completing checkout against the existing event schedule.
+
+### Remove rescheduling support entirely
+
+Rejected because organizers may reasonably need to correct scheduling mistakes before customers have committed to attending. Retaining a defined policy allows the capability to be introduced later without treating it as an immediate MVP requirement.
