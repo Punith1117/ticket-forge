@@ -12,10 +12,12 @@ import (
 
 type Querier interface {
 	ClaimOutboxEvents(ctx context.Context, arg ClaimOutboxEventsParams) ([]OutboxEvent, error)
+	CompleteIdempotencyRecord(ctx context.Context, arg CompleteIdempotencyRecordParams) (IdempotencyRecord, error)
 	CompleteOutboxEvent(ctx context.Context, arg CompleteOutboxEventParams) (int64, error)
 	ConsumePasswordResetToken(ctx context.Context, id pgtype.UUID) (int64, error)
 	ConsumeRegistrationChallenge(ctx context.Context, id pgtype.UUID) (int64, error)
 	CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error)
+	CreateIdempotencyRecord(ctx context.Context, arg CreateIdempotencyRecordParams) (IdempotencyRecord, error)
 	CreateOrganizerProfile(ctx context.Context, id pgtype.UUID) (OrganizerProfile, error)
 	CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error)
 	CreateRegistrationChallenge(ctx context.Context, arg CreateRegistrationChallengeParams) (RegistrationVerificationChallenge, error)
@@ -25,6 +27,7 @@ type Querier interface {
 	DeleteInactiveBuckets(ctx context.Context, arg DeleteInactiveBucketsParams) (int64, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) (int64, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
+	GetIdempotencyRecord(ctx context.Context, arg GetIdempotencyRecordParams) (IdempotencyRecord, error)
 	GetLatestPasswordResetTokenByUserID(ctx context.Context, userID pgtype.UUID) (PasswordResetToken, error)
 	GetLatestRegistrationChallengeByEmail(ctx context.Context, email string) (RegistrationVerificationChallenge, error)
 	GetOrganizerProfileByUserID(ctx context.Context, userID pgtype.UUID) (OrganizerProfile, error)

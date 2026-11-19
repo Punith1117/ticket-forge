@@ -47,7 +47,6 @@ type IdempotencyRecord struct {
 	ResponseStatus pgtype.Int4        `db:"response_status" json:"response_status"`
 	ResponseBody   []byte             `db:"response_body" json:"response_body"`
 	CreatedAt      pgtype.Timestamptz `db:"created_at" json:"created_at"`
-	ExpiresAt      pgtype.Timestamptz `db:"expires_at" json:"expires_at"`
 }
 
 type Inventory struct {
