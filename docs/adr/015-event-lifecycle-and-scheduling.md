@@ -7,9 +7,7 @@
 
 TicketForge needs a simple event lifecycle that supports organizers creating and managing events without introducing unnecessary lifecycle complexity.
 
-Events must support private preparation and public publication while keeping lifecycle status independent from visibility and booking availability.
-
-The system must also preserve historical event records after cancellation and completion.
+The system must preserve historical event records after cancellation and completion.
 
 Physical venue scheduling is managed independently through venue bookings. A venue booking reserves a physical venue and its time interval, while an event represents an activity organized using that booking.
 
@@ -26,37 +24,13 @@ An event has one of two persisted lifecycle statuses:
 
 There is no persisted `draft`, `published`, or `completed` lifecycle status.
 
-An event is created directly with status `active`.
+An event is created directly with status `active` and is immediately publicly visible.
 
 An event may transition from `active` to `cancelled`. This transition is terminal.
 
 A cancelled event cannot be reactivated. An organizer who wants to run the event again must create a new event.
 
-Event lifecycle is independent of its visibility and booking availability. These are represented by separate persisted fields.
-
-### Event visibility
-
-An event has one of two persisted visibility states:
-
-- `private`
-- `public`
-
-A newly created event starts as `private`.
-
-An event may transition from `private` to `public` through publication.
-
-Publication is a one-way transition. Once an event becomes public, it cannot become private again, regardless of whether it has received bookings.
-
-Cancellation is the only way to remove a previously public event from public listings.
-
-The effective public visibility of an event requires:
-
-- Lifecycle status is `active`.
-- Visibility is `public`.
-
-A private event remains accessible to its organizer but does not appear in public event listings.
-
-Private events may remain private indefinitely. No automatic draft expiration or publication deadline is introduced.
+An active event appears in public event listings. A cancelled event does not.
 
 ### Event booking availability
 
@@ -67,26 +41,21 @@ An event has one of two persisted booking availability states:
 
 A newly created event starts with booking availability `open`.
 
-Booking availability is independent of event lifecycle and visibility.
+Booking availability is independent of event lifecycle.
 
 An event may be paused or reopened by its organizer while it remains active.
 
-Publishing an event is a single user-facing action that makes the event public and sets its booking availability to `open`.
-
-A public event may subsequently be paused without becoming private or cancelled.
+A public event may be paused without being cancelled or removed from public listings.
 
 The effective booking availability of an event requires:
 
 - Lifecycle status is `active`.
-- Visibility is `public`.
 - Booking availability is `open`.
 - The applicable ticket sales windows and inventory conditions permit reservations.
 
-A private event cannot accept public reservations, regardless of its stored booking availability state.
-
 Pausing an event prevents new reservations but does not invalidate existing confirmed bookings or eligible unexpired held reservations. Existing eligible held reservations may still complete payment confirmation, provided the event has not been cancelled and the reservation remains valid.
 
-Cancellation overrides visibility and booking availability. A cancelled event is no longer publicly visible or bookable.
+Cancellation overrides booking availability. A cancelled event is no longer publicly visible or bookable.
 
 ### Event completion
 
@@ -173,35 +142,14 @@ Cancelling an event does not release the associated venue booking's time slot. T
 
 A venue booking may only be cancelled when it has no associated active event.
 
-### 8. Active events without ticket inventory
-
-An event may exist as active and private before ticket categories or inventory have been configured.
-
-Being active does not by itself mean that the event is publicly visible or bookable.
-
-A private event does not require ticket categories.
-
-However, publication requires the event to have:
-
-- A valid name and description.
-- At least one valid ticket category.
-- Valid pricing configuration.
-- Valid category capacity allocation.
-- Valid ticket sales configuration.
-
-Publishing an event makes it public and sets its booking availability to `open`.
-
-Booking availability remains subject to the applicable sales windows, inventory, and reservation rules described in ADR-016.
-
 ## Consequences
 
 ### Positive
 
 - A small event lifecycle is easier to understand and enforce.
-- Visibility and booking availability evolve independently from event lifecycle.
-- Private events can be prepared without requiring ticket inventory.
-- Publication has a clear, explicit transition.
-- Public events cannot silently become private again.
+- Event creation has a straightforward meaning: the event becomes publicly visible.
+- Booking availability remains independent of event lifecycle.
+- No separate publication operation or visibility state is needed.
 - No background job is needed to persist an event's completion.
 - Terminal cancellation preserves historical meaning.
 - Venue bookings and events have separate responsibilities and lifecycles.
@@ -211,9 +159,9 @@ Booking availability remains subject to the applicable sales windows, inventory,
 
 ### Negative
 
-- An active event may remain private and have no ticket inventory or public booking availability.
+- Organizers must create an event only when they are ready for it to become publicly visible.
 - The application must validate time-dependent scheduling rules when creating venue bookings.
-- The application must maintain consistent lifecycle, visibility, and booking availability transitions.
+- The application must maintain consistent lifecycle and booking availability transitions.
 - The database and application must consistently use timezone-aware timestamps.
 - Venue booking and event lifecycle management require separate domain logic.
 
@@ -221,11 +169,15 @@ Booking availability remains subject to the applicable sales windows, inventory,
 
 ### Draft, published, and completed lifecycle states
 
-Rejected for the MVP because publication and completion are separate concerns that do not need to be represented as lifecycle states.
+Rejected for the MVP because publication and completion do not need to be represented as lifecycle states.
 
-Private preparation is represented through event visibility, while publication is represented by the transition from `private` to `public`.
+Events are created directly as active and publicly visible. Completion is derived from the associated venue booking's end timestamp.
 
-Completion can be derived from the associated venue booking's end timestamp.
+### Separate private and public visibility
+
+Rejected because organizers are expected to create events only when they are ready to make them public.
+
+A separate visibility state and publication transition would introduce additional complexity without providing a required product capability.
 
 ### Persisted completed status
 
