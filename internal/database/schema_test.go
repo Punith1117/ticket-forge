@@ -45,6 +45,7 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 		DELETE FROM inventory;
 		DELETE FROM ticket_categories;
 		DELETE FROM events;
+		DELETE FROM venue_bookings;
 		DELETE FROM organizer_profiles;
 		DELETE FROM sessions;
 		DELETE FROM password_reset_tokens;
@@ -101,6 +102,35 @@ func createTestUserAndOrganizer(t *testing.T, ctx context.Context, pool *pgxpool
 	return userID, organizerID
 }
 
+func createTestVenueBooking(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	organizerID string,
+	venueID string,
+	startsAt time.Time,
+	endsAt time.Time,
+) string {
+	t.Helper()
+
+	var bookingID string
+	err := pool.QueryRow(ctx, `
+		INSERT INTO venue_bookings (
+			organizer_profile_id,
+			venue_id,
+			starts_at,
+			ends_at
+		)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id::text
+	`, organizerID, venueID, startsAt, endsAt).Scan(&bookingID)
+	if err != nil {
+		t.Fatalf("failed to create test venue booking: %v", err)
+	}
+
+	return bookingID
+}
+
 func TestSeedsApplication(t *testing.T) {
 	pool := setupTestDB(t)
 	defer pool.Close()
@@ -127,55 +157,54 @@ func TestVenueScheduleOverlapConstraint(t *testing.T) {
 	ctx := context.Background()
 	_, orgID := createTestUserAndOrganizer(t, ctx, pool, "org_overlap@ticketforge.dev")
 
-	venueID := "018f0000-0000-7000-8000-000000000001" // Kanteerava Stadium
+	venueID := "018f0000-0000-7000-8000-000000000001"
 	baseTime := time.Date(2027, 1, 15, 10, 0, 0, 0, time.UTC)
-	salesStart := baseTime.Add(-10 * 24 * time.Hour)
-	salesEnd := baseTime.Add(-1 * time.Hour)
 
-	// 1. First event: 10:00 to 12:00
-	event1Starts := baseTime
-	event1Ends := baseTime.Add(2 * time.Hour)
+	// 1. First booking: 10:00 to 12:00.
+	createTestVenueBooking(
+		t, ctx, pool, orgID, venueID,
+		baseTime, baseTime.Add(2*time.Hour),
+	)
+
+	// 2. Overlapping active booking: 11:00 to 13:00.
+	// Must fail because venue booking schedules cannot overlap.
 	_, err := pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Event 1', 'active', $3, $4, $5, $6)
-	`, orgID, venueID, event1Starts, event1Ends, salesStart, salesEnd)
-	if err != nil {
-		t.Fatalf("failed to insert event 1: %v", err)
+        INSERT INTO venue_bookings (
+            organizer_profile_id, venue_id, starts_at, ends_at
+        )
+        VALUES ($1, $2, $3, $4)
+    `, orgID, venueID, baseTime.Add(time.Hour), baseTime.Add(3*time.Hour))
+
+	if err == nil {
+		t.Fatal("expected exclusion constraint violation for overlapping venue booking")
 	}
 
-	// 2. Overlapping active event: 11:00 to 13:00 -> MUST FAIL
-	event2Starts := baseTime.Add(1 * time.Hour)
-	event2Ends := baseTime.Add(3 * time.Hour)
-	_, err = pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Event 2 Overlapping', 'active', $3, $4, $5, $6)
-	`, orgID, venueID, event2Starts, event2Ends, salesStart, salesEnd)
-	if err == nil {
-		t.Fatal("expected exclusion constraint violation for overlapping active event, but insertion succeeded")
-	}
 	pgErr, ok := err.(*pgconn.PgError)
-	if !ok || pgErr.Code != "23P01" { // 23P01 is exclusion_violation
+	if !ok || pgErr.Code != "23P01" {
 		t.Fatalf("expected exclusion_violation (23P01), got: %v", err)
 	}
 
-	// 3. Adjacent half-open event: 12:00 to 14:00 [10:00, 12:00) and [12:00, 14:00) -> MUST SUCCEED
-	event3Starts := event1Ends
-	event3Ends := baseTime.Add(4 * time.Hour)
-	_, err = pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Event 3 Adjacent', 'active', $3, $4, $5, $6)
-	`, orgID, venueID, event3Starts, event3Ends, salesStart, salesEnd)
-	if err != nil {
-		t.Fatalf("adjacent event should not overlap with [) bounds: %v", err)
-	}
+	// 3. Adjacent booking: 12:00 to 14:00.
+	// Must succeed because schedules use half-open [) ranges.
+	createTestVenueBooking(
+		t, ctx, pool, orgID, venueID,
+		baseTime.Add(2*time.Hour),
+		baseTime.Add(4*time.Hour),
+	)
 
-	// 4. Overlapping cancelled event: 10:30 to 11:30 with status = 'cancelled' -> MUST SUCCEED
+	// 4. Cancelled overlapping booking: 10:30 to 11:30.
+	// Must succeed because cancelled bookings are excluded from the constraint.
 	_, err = pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Event 4 Cancelled Overlap', 'cancelled', $3, $4, $5, $6)
-	`, orgID, venueID, baseTime.Add(30*time.Minute), baseTime.Add(90*time.Minute), salesStart, salesEnd)
+        INSERT INTO venue_bookings (
+            organizer_profile_id, venue_id, starts_at, ends_at, status
+        )
+        VALUES ($1, $2, $3, $4, 'cancelled')
+    `, orgID, venueID,
+		baseTime.Add(30*time.Minute),
+		baseTime.Add(90*time.Minute),
+	)
 	if err != nil {
-		t.Fatalf("cancelled event must not trigger schedule exclusion: %v", err)
+		t.Fatalf("cancelled booking must not trigger schedule exclusion: %v", err)
 	}
 }
 
@@ -188,11 +217,23 @@ func TestInvalidStateConstraints(t *testing.T) {
 	venueID := "018f0000-0000-7000-8000-000000000002"
 	now := time.Now().UTC().Add(48 * time.Hour)
 
+	venueBookingID := createTestVenueBooking(
+		t, ctx, pool, orgID, venueID,
+		now, now.Add(2*time.Hour),
+	)
+
 	// Inserting invalid status 'finished' must fail CHECK constraint
 	_, err := pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Invalid State Event', 'finished', $3, $4, $5, $6)
-	`, orgID, venueID, now, now.Add(2*time.Hour), now.Add(-24*time.Hour), now.Add(-1*time.Hour))
+			INSERT INTO events (
+					organizer_profile_id,
+					venue_booking_id,
+					title,
+					status,
+					sales_start_at,
+					sales_end_at
+			)
+			VALUES ($1, $2, 'Invalid State Event', 'finished', $3, $4)
+	`, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour))
 	if err == nil {
 		t.Fatal("expected check constraint violation for invalid event status, but succeeded")
 	}
@@ -211,12 +252,24 @@ func TestInvalidInventoryQuantities(t *testing.T) {
 	venueID := "018f0000-0000-7000-8000-000000000003"
 	now := time.Now().UTC().Add(48 * time.Hour)
 
+	venueBookingID := createTestVenueBooking(
+		t, ctx, pool, orgID, venueID,
+		now, now.Add(2*time.Hour),
+	)
+
 	var eventID string
 	err := pool.QueryRow(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Inv Test Event', 'active', $3, $4, $5, $6)
-		RETURNING id::text
-	`, orgID, venueID, now, now.Add(2*time.Hour), now.Add(-24*time.Hour), now.Add(-1*time.Hour)).Scan(&eventID)
+			INSERT INTO events (
+					organizer_profile_id,
+					venue_booking_id,
+					title,
+					status,
+					sales_start_at,
+					sales_end_at
+			)
+			VALUES ($1, $2, 'Inv Test Event', 'active', $3, $4)
+			RETURNING id::text
+	`, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour)).Scan(&eventID)
 	if err != nil {
 		t.Fatalf("failed to insert event: %v", err)
 	}
@@ -254,12 +307,24 @@ func TestUniqueReservationToBookingRelationship(t *testing.T) {
 	venueID := "018f0000-0000-7000-8000-000000000004"
 	now := time.Now().UTC().Add(48 * time.Hour)
 
+	venueBookingID := createTestVenueBooking(
+		t, ctx, pool, orgID, venueID,
+		now, now.Add(2*time.Hour),
+	)
+
 	var eventID, catID string
 	err := pool.QueryRow(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Booking Unique Test Event', 'active', $3, $4, $5, $6)
-		RETURNING id::text
-	`, orgID, venueID, now, now.Add(2*time.Hour), now.Add(-24*time.Hour), now.Add(-1*time.Hour)).Scan(&eventID)
+			INSERT INTO events (
+					organizer_profile_id,
+					venue_booking_id,
+					title,
+					status,
+					sales_start_at,
+					sales_end_at
+			)
+			VALUES ($1, $2, 'Booking Unique Test Event', 'active', $3, $4)
+			RETURNING id::text
+	`, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour)).Scan(&eventID)
 	if err != nil {
 		t.Fatalf("failed to insert event: %v", err)
 	}
@@ -333,39 +398,65 @@ func TestUniqueReservationToBookingRelationship(t *testing.T) {
 func TestForeignKeyRestrictions(t *testing.T) {
 	pool := setupTestDB(t)
 	defer pool.Close()
+	loadSeeds(t, pool)
 
 	ctx := context.Background()
 	_, orgID := createTestUserAndOrganizer(t, ctx, pool, "org_fk@ticketforge.dev")
+
 	nonExistentVenue := "00000000-0000-0000-0000-000000000099"
 	now := time.Now().UTC().Add(48 * time.Hour)
 
-	// Inserting event referencing non-existent venue fails FK check
+	// 1. A venue booking referencing a nonexistent venue must fail.
 	_, err := pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'FK Failure Event', 'active', $3, $4, $5, $6)
-	`, orgID, nonExistentVenue, now, now.Add(2*time.Hour), now.Add(-24*time.Hour), now.Add(-1*time.Hour))
+        INSERT INTO venue_bookings (
+            organizer_profile_id,
+            venue_id,
+            starts_at,
+            ends_at
+        )
+        VALUES ($1, $2, $3, $4)
+    `, orgID, nonExistentVenue, now, now.Add(2*time.Hour))
+
 	if err == nil {
-		t.Fatal("expected foreign key violation for non-existent venue, but succeeded")
+		t.Fatal("expected foreign key violation for nonexistent venue")
 	}
+
 	pgErr, ok := err.(*pgconn.PgError)
-	if !ok || pgErr.Code != "23503" { // 23503 is foreign_key_violation
+	if !ok || pgErr.Code != "23503" {
 		t.Fatalf("expected foreign_key_violation (23503), got: %v", err)
 	}
 
-	// Deleting a venue that has events must fail due to ON DELETE RESTRICT
+	// 2. Create a valid venue booking.
 	realVenueID := "018f0000-0000-7000-8000-000000000005"
+
+	venueBookingID := createTestVenueBooking(
+		t, ctx, pool, orgID, realVenueID,
+		now, now.Add(2*time.Hour),
+	)
+
+	// 3. Create an event referencing that venue booking.
 	_, err = pool.Exec(ctx, `
-		INSERT INTO events (organizer_profile_id, venue_id, title, status, starts_at, ends_at, sales_start_at, sales_end_at)
-		VALUES ($1, $2, 'Restrict Event', 'active', $3, $4, $5, $6)
-	`, orgID, realVenueID, now, now.Add(2*time.Hour), now.Add(-24*time.Hour), now.Add(-1*time.Hour))
+        INSERT INTO events (
+            organizer_profile_id,
+            venue_booking_id,
+            title,
+            status,
+            sales_start_at,
+            sales_end_at
+        )
+        VALUES ($1, $2, 'Restrict Event', 'active', $3, $4)
+    `, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour))
 	if err != nil {
-		t.Fatalf("failed to insert event on real venue: %v", err)
+		t.Fatalf("failed to insert event on real venue booking: %v", err)
 	}
 
+	// 4. Deleting the venue must fail because its venue booking references it.
 	_, err = pool.Exec(ctx, "DELETE FROM venues WHERE id = $1", realVenueID)
+
 	if err == nil {
-		t.Fatal("expected foreign key restrict violation when deleting venue with events, but succeeded")
+		t.Fatal("expected foreign key restrict violation when deleting venue with bookings")
 	}
+
 	pgErr, ok = err.(*pgconn.PgError)
 	if !ok || (pgErr.Code != "23001" && pgErr.Code != "23503") {
 		t.Fatalf("expected restrict_violation (23001) or foreign_key_violation (23503), got: %v", err)

@@ -12,7 +12,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var ErrUserNotFound = errors.New("organizer: user not found")
+var (
+	ErrUserNotFound    = errors.New("organizer: user not found")
+	ErrProfileNotFound = errors.New("organizer: profile not found")
+)
 
 type Service struct {
 	queries *sqlc.Queries
@@ -69,4 +72,34 @@ func (s *Service) CreateOrGetProfile(
 	}
 
 	return profile, false, nil
+}
+
+// GetProfileByUserID retrieves an existing organizer profile for a user.
+func (s *Service) GetProfileByUserID(
+	ctx context.Context,
+	userID string,
+) (sqlc.OrganizerProfile, error) {
+	id, err := uuid.Parse(userID)
+	if err != nil {
+		return sqlc.OrganizerProfile{}, fmt.Errorf(
+			"organizer: invalid user ID: %w", err,
+		)
+	}
+
+	var dbID pgtype.UUID
+	copy(dbID.Bytes[:], id[:])
+	dbID.Valid = true
+
+	profile, err := s.queries.GetOrganizerProfileByUserID(ctx, dbID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return sqlc.OrganizerProfile{}, ErrProfileNotFound
+		}
+
+		return sqlc.OrganizerProfile{}, fmt.Errorf(
+			"organizer: failed to retrieve profile: %w", err,
+		)
+	}
+
+	return profile, nil
 }

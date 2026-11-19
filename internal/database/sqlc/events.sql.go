@@ -14,30 +14,26 @@ import (
 const createEvent = `-- name: CreateEvent :one
 INSERT INTO events (
     organizer_profile_id,
-    venue_id,
+    venue_booking_id,
     title,
     description,
     status,
     booking_status,
-    starts_at,
-    ends_at,
     sales_start_at,
     sales_end_at
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, $2, $3, $4, $5, $6, $7, $8
 )
-RETURNING id, organizer_profile_id, venue_id, title, description, status, booking_status, starts_at, ends_at, sales_start_at, sales_end_at, created_at, updated_at, schedule_range
+RETURNING id, organizer_profile_id, title, description, status, booking_status, sales_start_at, sales_end_at, created_at, updated_at, venue_booking_id
 `
 
 type CreateEventParams struct {
 	OrganizerProfileID pgtype.UUID        `db:"organizer_profile_id" json:"organizer_profile_id"`
-	VenueID            pgtype.UUID        `db:"venue_id" json:"venue_id"`
+	VenueBookingID     pgtype.UUID        `db:"venue_booking_id" json:"venue_booking_id"`
 	Title              string             `db:"title" json:"title"`
 	Description        string             `db:"description" json:"description"`
 	Status             string             `db:"status" json:"status"`
 	BookingStatus      string             `db:"booking_status" json:"booking_status"`
-	StartsAt           pgtype.Timestamptz `db:"starts_at" json:"starts_at"`
-	EndsAt             pgtype.Timestamptz `db:"ends_at" json:"ends_at"`
 	SalesStartAt       pgtype.Timestamptz `db:"sales_start_at" json:"sales_start_at"`
 	SalesEndAt         pgtype.Timestamptz `db:"sales_end_at" json:"sales_end_at"`
 }
@@ -45,13 +41,11 @@ type CreateEventParams struct {
 func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error) {
 	row := q.db.QueryRow(ctx, createEvent,
 		arg.OrganizerProfileID,
-		arg.VenueID,
+		arg.VenueBookingID,
 		arg.Title,
 		arg.Description,
 		arg.Status,
 		arg.BookingStatus,
-		arg.StartsAt,
-		arg.EndsAt,
 		arg.SalesStartAt,
 		arg.SalesEndAt,
 	)
@@ -59,25 +53,24 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 	err := row.Scan(
 		&i.ID,
 		&i.OrganizerProfileID,
-		&i.VenueID,
 		&i.Title,
 		&i.Description,
 		&i.Status,
 		&i.BookingStatus,
-		&i.StartsAt,
-		&i.EndsAt,
 		&i.SalesStartAt,
 		&i.SalesEndAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.ScheduleRange,
+		&i.VenueBookingID,
 	)
 	return i, err
 }
 
 const getEventByID = `-- name: GetEventByID :one
-SELECT id, organizer_profile_id, venue_id, title, description, status, booking_status, starts_at, ends_at, sales_start_at, sales_end_at, created_at, updated_at, schedule_range FROM events
-WHERE id = $1 LIMIT 1
+SELECT id, organizer_profile_id, title, description, status, booking_status, sales_start_at, sales_end_at, created_at, updated_at, venue_booking_id
+FROM events
+WHERE id = $1
+LIMIT 1
 `
 
 func (q *Queries) GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error) {
@@ -86,30 +79,30 @@ func (q *Queries) GetEventByID(ctx context.Context, id pgtype.UUID) (Event, erro
 	err := row.Scan(
 		&i.ID,
 		&i.OrganizerProfileID,
-		&i.VenueID,
 		&i.Title,
 		&i.Description,
 		&i.Status,
 		&i.BookingStatus,
-		&i.StartsAt,
-		&i.EndsAt,
 		&i.SalesStartAt,
 		&i.SalesEndAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.ScheduleRange,
+		&i.VenueBookingID,
 	)
 	return i, err
 }
 
-const listEventsByVenue = `-- name: ListEventsByVenue :many
-SELECT id, organizer_profile_id, venue_id, title, description, status, booking_status, starts_at, ends_at, sales_start_at, sales_end_at, created_at, updated_at, schedule_range FROM events
-WHERE venue_id = $1
-ORDER BY starts_at ASC
+const listAllEventsByVenue = `-- name: ListAllEventsByVenue :many
+SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.sales_start_at, e.sales_end_at, e.created_at, e.updated_at, e.venue_booking_id
+FROM events e
+JOIN venue_bookings vb
+    ON vb.id = e.venue_booking_id
+WHERE vb.venue_id = $1
+ORDER BY vb.starts_at ASC
 `
 
-func (q *Queries) ListEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error) {
-	rows, err := q.db.Query(ctx, listEventsByVenue, venueID)
+func (q *Queries) ListAllEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listAllEventsByVenue, venueID)
 	if err != nil {
 		return nil, err
 	}
@@ -120,18 +113,57 @@ func (q *Queries) ListEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([
 		if err := rows.Scan(
 			&i.ID,
 			&i.OrganizerProfileID,
-			&i.VenueID,
 			&i.Title,
 			&i.Description,
 			&i.Status,
 			&i.BookingStatus,
-			&i.StartsAt,
-			&i.EndsAt,
 			&i.SalesStartAt,
 			&i.SalesEndAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.ScheduleRange,
+			&i.VenueBookingID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPublicEventsByVenue = `-- name: ListPublicEventsByVenue :many
+SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.sales_start_at, e.sales_end_at, e.created_at, e.updated_at, e.venue_booking_id
+FROM events e
+JOIN venue_bookings vb
+    ON vb.id = e.venue_booking_id
+WHERE vb.venue_id = $1
+  AND e.status = 'active'
+ORDER BY vb.starts_at ASC
+`
+
+func (q *Queries) ListPublicEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listPublicEventsByVenue, venueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Event{}
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizerProfileID,
+			&i.Title,
+			&i.Description,
+			&i.Status,
+			&i.BookingStatus,
+			&i.SalesStartAt,
+			&i.SalesEndAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.VenueBookingID,
 		); err != nil {
 			return nil, err
 		}

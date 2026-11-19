@@ -22,20 +22,17 @@ type Booking struct {
 }
 
 type Event struct {
-	ID                 pgtype.UUID                      `db:"id" json:"id"`
-	OrganizerProfileID pgtype.UUID                      `db:"organizer_profile_id" json:"organizer_profile_id"`
-	VenueID            pgtype.UUID                      `db:"venue_id" json:"venue_id"`
-	Title              string                           `db:"title" json:"title"`
-	Description        string                           `db:"description" json:"description"`
-	Status             string                           `db:"status" json:"status"`
-	BookingStatus      string                           `db:"booking_status" json:"booking_status"`
-	StartsAt           pgtype.Timestamptz               `db:"starts_at" json:"starts_at"`
-	EndsAt             pgtype.Timestamptz               `db:"ends_at" json:"ends_at"`
-	SalesStartAt       pgtype.Timestamptz               `db:"sales_start_at" json:"sales_start_at"`
-	SalesEndAt         pgtype.Timestamptz               `db:"sales_end_at" json:"sales_end_at"`
-	CreatedAt          pgtype.Timestamptz               `db:"created_at" json:"created_at"`
-	UpdatedAt          pgtype.Timestamptz               `db:"updated_at" json:"updated_at"`
-	ScheduleRange      pgtype.Range[pgtype.Timestamptz] `db:"schedule_range" json:"schedule_range"`
+	ID                 pgtype.UUID        `db:"id" json:"id"`
+	OrganizerProfileID pgtype.UUID        `db:"organizer_profile_id" json:"organizer_profile_id"`
+	Title              string             `db:"title" json:"title"`
+	Description        string             `db:"description" json:"description"`
+	Status             string             `db:"status" json:"status"`
+	BookingStatus      string             `db:"booking_status" json:"booking_status"`
+	SalesStartAt       pgtype.Timestamptz `db:"sales_start_at" json:"sales_start_at"`
+	SalesEndAt         pgtype.Timestamptz `db:"sales_end_at" json:"sales_end_at"`
+	CreatedAt          pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
+	VenueBookingID     pgtype.UUID        `db:"venue_booking_id" json:"venue_booking_id"`
 }
 
 type IdempotencyRecord struct {
@@ -195,4 +192,16 @@ type Venue struct {
 	IsActive      bool               `db:"is_active" json:"is_active"`
 	CreatedAt     pgtype.Timestamptz `db:"created_at" json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
+}
+
+type VenueBooking struct {
+	ID                 pgtype.UUID                      `db:"id" json:"id"`
+	OrganizerProfileID pgtype.UUID                      `db:"organizer_profile_id" json:"organizer_profile_id"`
+	VenueID            pgtype.UUID                      `db:"venue_id" json:"venue_id"`
+	StartsAt           pgtype.Timestamptz               `db:"starts_at" json:"starts_at"`
+	EndsAt             pgtype.Timestamptz               `db:"ends_at" json:"ends_at"`
+	Status             string                           `db:"status" json:"status"`
+	CreatedAt          pgtype.Timestamptz               `db:"created_at" json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz               `db:"updated_at" json:"updated_at"`
+	ScheduleRange      pgtype.Range[pgtype.Timestamptz] `db:"schedule_range" json:"schedule_range"`
 }

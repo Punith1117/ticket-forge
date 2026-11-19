@@ -17,6 +17,7 @@ import (
 	"github.com/Punith1117/ticket-forge/internal/organizer"
 	"github.com/Punith1117/ticket-forge/internal/ratelimit"
 	"github.com/Punith1117/ticket-forge/internal/security"
+	"github.com/Punith1117/ticket-forge/internal/venuebooking"
 )
 
 func main() {
@@ -126,10 +127,22 @@ func main() {
 
 	organizerHandler := organizer.NewHandler(organizerService, logger)
 
+	// Venue Booking Service & Handler
+	venueBookingService, err := venuebooking.NewService(pool)
+	if err != nil {
+		logger.Error("Failed to initialize venue booking service", "error", err)
+		os.Exit(1)
+	}
+
+	venueBookingHandler := venuebooking.NewHandler(
+		venueBookingService,
+		organizerService,
+		logger,
+	)
 	mux := http.NewServeMux()
 	authHandler.RegisterRoutes(mux)
 	organizerHandler.RegisterRoutes(mux, authHandler)
-
+	venueBookingHandler.RegisterRoutes(mux, authHandler)
 	// Health check endpoint
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
