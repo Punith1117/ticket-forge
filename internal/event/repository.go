@@ -117,3 +117,77 @@ func (r *Repository) CreateTicketCategory(
 
 	return category, nil
 }
+
+// LockActiveEventForOrganizer locks an active event belonging
+// to the specified organizer within a transaction.
+func (r *Repository) LockActiveEventForOrganizer(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID pgtype.UUID,
+	organizerProfileID pgtype.UUID,
+) (sqlc.Event, error) {
+	var event sqlc.Event
+
+	err := tx.QueryRow(ctx, `
+		SELECT
+			id,
+			organizer_profile_id,
+			title,
+			description,
+			status,
+			booking_status,
+			created_at,
+			updated_at,
+			venue_booking_id
+		FROM events
+		WHERE id = $1
+		  AND organizer_profile_id = $2
+		FOR UPDATE
+	`,
+		eventID,
+		organizerProfileID,
+	).Scan(
+		&event.ID,
+		&event.OrganizerProfileID,
+		&event.Title,
+		&event.Description,
+		&event.Status,
+		&event.BookingStatus,
+		&event.CreatedAt,
+		&event.UpdatedAt,
+		&event.VenueBookingID,
+	)
+	if err != nil {
+		return sqlc.Event{}, fmt.Errorf(
+			"event: lock event for organizer: %w",
+			err,
+		)
+	}
+
+	return event, nil
+}
+
+// UpdateActiveEventBookingStatus updates the booking status
+// of an active event within a transaction.
+func (r *Repository) UpdateActiveEventBookingStatus(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID pgtype.UUID,
+	bookingStatus string,
+) (sqlc.Event, error) {
+	updatedEvent, err := sqlc.New(tx).UpdateActiveEventBookingStatus(
+		ctx,
+		sqlc.UpdateActiveEventBookingStatusParams{
+			ID:            eventID,
+			BookingStatus: bookingStatus,
+		},
+	)
+	if err != nil {
+		return sqlc.Event{}, fmt.Errorf(
+			"event: update booking status: %w",
+			err,
+		)
+	}
+
+	return updatedEvent, nil
+}

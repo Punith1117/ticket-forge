@@ -56,6 +56,24 @@ func TestHandleServiceError(t *testing.T) {
 			wantStatusCode: http.StatusBadRequest,
 		},
 		{
+			name:           "event not found",
+			err:            ErrEventNotFound,
+			wantHandled:    true,
+			wantStatusCode: http.StatusNotFound,
+		},
+		{
+			name:           "event not active",
+			err:            ErrEventNotActive,
+			wantHandled:    true,
+			wantStatusCode: http.StatusConflict,
+		},
+		{
+			name:           "invalid booking status",
+			err:            ErrInvalidBookingStatus,
+			wantHandled:    true,
+			wantStatusCode: http.StatusBadRequest,
+		},
+		{
 			name:           "invalid idempotency request",
 			err:            idempotency.ErrInvalidRequest,
 			wantHandled:    true,
@@ -116,6 +134,28 @@ func TestCreateEvent_RequiresAuthentication(t *testing.T) {
 	recorder := httptest.NewRecorder()
 
 	handler.CreateEvent(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusUnauthorized,
+			recorder.Code,
+		)
+	}
+}
+
+func TestUpdateBookingStatus_RequiresAuthentication(t *testing.T) {
+	handler := NewHandler(nil, nil, nil)
+
+	req := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/v1/events/test-event-id/booking-status",
+		strings.NewReader(`{"booking_status":"paused"}`),
+	)
+
+	recorder := httptest.NewRecorder()
+
+	handler.UpdateBookingStatus(recorder, req)
 
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf(

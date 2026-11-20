@@ -227,3 +227,35 @@ func (q *Queries) ListPublicEventsByVenue(ctx context.Context, venueID pgtype.UU
 	}
 	return items, nil
 }
+
+const updateActiveEventBookingStatus = `-- name: UpdateActiveEventBookingStatus :one
+UPDATE events
+SET
+    booking_status = $2,
+    updated_at = NOW()
+WHERE id = $1
+  AND status = 'active'
+RETURNING id, organizer_profile_id, title, description, status, booking_status, created_at, updated_at, venue_booking_id
+`
+
+type UpdateActiveEventBookingStatusParams struct {
+	ID            pgtype.UUID `db:"id" json:"id"`
+	BookingStatus string      `db:"booking_status" json:"booking_status"`
+}
+
+func (q *Queries) UpdateActiveEventBookingStatus(ctx context.Context, arg UpdateActiveEventBookingStatusParams) (Event, error) {
+	row := q.db.QueryRow(ctx, updateActiveEventBookingStatus, arg.ID, arg.BookingStatus)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizerProfileID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.BookingStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.VenueBookingID,
+	)
+	return i, err
+}

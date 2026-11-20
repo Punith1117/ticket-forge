@@ -44,3 +44,12 @@ type CreateEventResponse struct {
 	Event            EventResponse            `json:"event"`
 	TicketCategories []TicketCategoryResponse `json:"ticket_categories"`
 }
+
+type UpdateBookingStatusRequest struct {
+	BookingStatus string `json:"booking_status"`
+}
+
+type UpdateBookingStatusResponse struct {
+	Message string        `json:"message"`
+	Event   EventResponse `json:"event"`
+}

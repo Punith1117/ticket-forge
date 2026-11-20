@@ -52,3 +52,12 @@ INSERT INTO ticket_categories (
 $1, $2, $3, 'INR', $4
 )
 RETURNING *;
+
+-- name: UpdateActiveEventBookingStatus :one
+UPDATE events
+SET
+    booking_status = $2,
+    updated_at = NOW()
+WHERE id = $1
+  AND status = 'active'
+RETURNING *;

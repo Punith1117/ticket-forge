@@ -19,8 +19,9 @@ import (
 const (
 	createEventOperation = "event.create"
 
-	eventStatusActive = "active"
-	bookingStatusOpen = "open"
+	eventStatusActive   = "active"
+	bookingStatusOpen   = "open"
+	bookingStatusPaused = "paused"
 )
 
 type Service struct {
@@ -270,6 +271,113 @@ func (s *Service) Create(
 	if err := tx.Commit(ctx); err != nil {
 		return CreateEventResponse{}, fmt.Errorf(
 			"event: failed to commit event transaction: %w", err,
+		)
+	}
+
+	return response, nil
+}
+
+// UpdateBookingStatus changes whether customers can make new
+// bookings for an event.
+func (s *Service) UpdateBookingStatus(
+	ctx context.Context,
+	organizerProfileID string,
+	eventID string,
+	req UpdateBookingStatusRequest,
+) (UpdateBookingStatusResponse, error) {
+	var response UpdateBookingStatusResponse
+
+	organizerUUID, err := uuid.Parse(organizerProfileID)
+	if err != nil {
+		return response, fmt.Errorf(
+			"event: invalid organizer profile ID: %w",
+			err,
+		)
+	}
+
+	eventUUID, err := uuid.Parse(eventID)
+	if err != nil {
+		return response, ErrEventNotFound
+	}
+
+	// Normalize and validate the requested status.
+	req.BookingStatus = strings.TrimSpace(req.BookingStatus)
+
+	if req.BookingStatus != bookingStatusOpen &&
+		req.BookingStatus != bookingStatusPaused {
+		return response, ErrInvalidBookingStatus
+	}
+
+	organizerIDParam := pgtype.UUID{
+		Bytes: organizerUUID,
+		Valid: true,
+	}
+
+	eventIDParam := pgtype.UUID{
+		Bytes: eventUUID,
+		Valid: true,
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return response, fmt.Errorf(
+			"event: failed to begin booking status transaction: %w",
+			err,
+		)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	// Lock the event and verify that it belongs to this organizer.
+	event, err := s.repository.LockActiveEventForOrganizer(
+		ctx,
+		tx,
+		eventIDParam,
+		organizerIDParam,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return response, ErrEventNotFound
+		}
+
+		return response, err
+	}
+
+	// Cancelled events must never be reopened.
+	if event.Status != eventStatusActive {
+		return response, ErrEventNotActive
+	}
+
+	updatedEvent, err := s.repository.UpdateActiveEventBookingStatus(
+		ctx,
+		tx,
+		eventIDParam,
+		req.BookingStatus,
+	)
+	if err != nil {
+		return response, err
+	}
+
+	response = UpdateBookingStatusResponse{
+		Message: "Event booking status updated successfully",
+		Event: EventResponse{
+			ID:                 updatedEvent.ID.String(),
+			OrganizerProfileID: updatedEvent.OrganizerProfileID.String(),
+			VenueBookingID:     updatedEvent.VenueBookingID.String(),
+			Title:              updatedEvent.Title,
+			Description:        updatedEvent.Description,
+			Status:             updatedEvent.Status,
+			BookingStatus:      updatedEvent.BookingStatus,
+			CreatedAt:          updatedEvent.CreatedAt.Time,
+			UpdatedAt:          updatedEvent.UpdatedAt.Time,
+		},
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return UpdateBookingStatusResponse{}, fmt.Errorf(
+			"event: failed to commit booking status update: %w",
+			err,
 		)
 	}
 

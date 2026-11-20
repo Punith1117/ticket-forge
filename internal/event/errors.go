@@ -26,4 +26,16 @@ var (
 	ErrTicketCapacityExceeded = errors.New(
 		"event: total ticket category capacity exceeds venue capacity",
 	)
+
+	ErrEventNotFound = errors.New(
+		"event not found",
+	)
+
+	ErrEventNotActive = errors.New(
+		"event is not active",
+	)
+
+	ErrInvalidBookingStatus = errors.New(
+		"invalid booking status",
+	)
 )

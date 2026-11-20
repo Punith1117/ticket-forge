@@ -92,6 +92,39 @@ func createTestUserAndOrganizer(
 	return userID, organizerID
 }
 
+func createTestEvent(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	service *event.Service,
+	userID string,
+	organizerID string,
+) string {
+	t.Helper()
+
+	venueID, _ := getActiveVenue(t, ctx, pool)
+	bookingID := createTestVenueBooking(
+		t,
+		ctx,
+		pool,
+		organizerID,
+		venueID,
+	)
+
+	response, err := service.Create(
+		ctx,
+		userID,
+		organizerID,
+		uuid.NewString(),
+		newCreateEventRequest(bookingID),
+	)
+	if err != nil {
+		t.Fatalf("failed to create test event: %v", err)
+	}
+
+	return response.Event.ID
+}
+
 func getActiveVenue(
 	t *testing.T,
 	ctx context.Context,
@@ -652,5 +685,248 @@ func TestCreate_ConcurrentCreationForSameBooking(t *testing.T) {
 
 	if count != 1 {
 		t.Fatalf("expected exactly 1 active event in database, got %d", count)
+	}
+}
+
+func TestUpdateBookingStatus_PauseEvent(t *testing.T) {
+	pool, service := setupIntegrationDB(t)
+	ctx := context.Background()
+
+	userID, organizerID := createTestUserAndOrganizer(t, ctx, pool)
+
+	eventID := createTestEvent(
+		t,
+		ctx,
+		pool,
+		service,
+		userID,
+		organizerID,
+	)
+
+	response, err := service.UpdateBookingStatus(
+		ctx,
+		organizerID,
+		eventID,
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "paused",
+		},
+	)
+	if err != nil {
+		t.Fatalf("UpdateBookingStatus failed: %v", err)
+	}
+
+	if response.Event.BookingStatus != "paused" {
+		t.Errorf(
+			"expected booking status paused, got %s",
+			response.Event.BookingStatus,
+		)
+	}
+
+	if response.Event.Status != "active" {
+		t.Errorf(
+			"expected event status active, got %s",
+			response.Event.Status,
+		)
+	}
+
+	var bookingStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT booking_status
+		FROM events
+		WHERE id = $1
+	`, eventID).Scan(&bookingStatus)
+	if err != nil {
+		t.Fatalf("failed to retrieve event booking status: %v", err)
+	}
+
+	if bookingStatus != "paused" {
+		t.Errorf("expected database status paused, got %s", bookingStatus)
+	}
+}
+
+func TestUpdateBookingStatus_ReopenEvent(t *testing.T) {
+	pool, service := setupIntegrationDB(t)
+	ctx := context.Background()
+
+	userID, organizerID := createTestUserAndOrganizer(t, ctx, pool)
+
+	eventID := createTestEvent(
+		t,
+		ctx,
+		pool,
+		service,
+		userID,
+		organizerID,
+	)
+
+	_, err := service.UpdateBookingStatus(
+		ctx,
+		organizerID,
+		eventID,
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "paused",
+		},
+	)
+	if err != nil {
+		t.Fatalf("failed to pause event: %v", err)
+	}
+
+	response, err := service.UpdateBookingStatus(
+		ctx,
+		organizerID,
+		eventID,
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "open",
+		},
+	)
+	if err != nil {
+		t.Fatalf("failed to reopen event: %v", err)
+	}
+
+	if response.Event.BookingStatus != "open" {
+		t.Errorf(
+			"expected booking status open, got %s",
+			response.Event.BookingStatus,
+		)
+	}
+}
+
+func TestUpdateBookingStatus_RejectsAnotherOrganizer(t *testing.T) {
+	pool, service := setupIntegrationDB(t)
+	ctx := context.Background()
+
+	userID, organizerID := createTestUserAndOrganizer(t, ctx, pool)
+	_, anotherOrganizerID := createTestUserAndOrganizer(t, ctx, pool)
+
+	eventID := createTestEvent(
+		t,
+		ctx,
+		pool,
+		service,
+		userID,
+		organizerID,
+	)
+
+	_, err := service.UpdateBookingStatus(
+		ctx,
+		anotherOrganizerID,
+		eventID,
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "paused",
+		},
+	)
+
+	if !errors.Is(err, event.ErrEventNotFound) {
+		t.Fatalf("expected ErrEventNotFound, got %v", err)
+	}
+
+	var bookingStatus string
+	err = pool.QueryRow(ctx, `
+		SELECT booking_status
+		FROM events
+		WHERE id = $1
+	`, eventID).Scan(&bookingStatus)
+	if err != nil {
+		t.Fatalf("failed to retrieve event: %v", err)
+	}
+
+	if bookingStatus != "open" {
+		t.Errorf(
+			"expected booking status to remain open, got %s",
+			bookingStatus,
+		)
+	}
+}
+
+func TestUpdateBookingStatus_RejectsCancelledEvent(t *testing.T) {
+	pool, service := setupIntegrationDB(t)
+	ctx := context.Background()
+
+	userID, organizerID := createTestUserAndOrganizer(t, ctx, pool)
+
+	eventID := createTestEvent(
+		t,
+		ctx,
+		pool,
+		service,
+		userID,
+		organizerID,
+	)
+
+	_, err := pool.Exec(ctx, `
+		UPDATE events
+		SET status = 'cancelled'
+		WHERE id = $1
+	`, eventID)
+	if err != nil {
+		t.Fatalf("failed to cancel test event: %v", err)
+	}
+
+	_, err = service.UpdateBookingStatus(
+		ctx,
+		organizerID,
+		eventID,
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "open",
+		},
+	)
+
+	if !errors.Is(err, event.ErrEventNotActive) {
+		t.Fatalf("expected ErrEventNotActive, got %v", err)
+	}
+}
+
+func TestUpdateBookingStatus_RejectsInvalidStatus(t *testing.T) {
+	pool, service := setupIntegrationDB(t)
+	ctx := context.Background()
+
+	_, organizerID := createTestUserAndOrganizer(t, ctx, pool)
+
+	_, err := service.UpdateBookingStatus(
+		ctx,
+		organizerID,
+		uuid.NewString(),
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "closed",
+		},
+	)
+
+	if !errors.Is(err, event.ErrInvalidBookingStatus) {
+		t.Fatalf("expected ErrInvalidBookingStatus, got %v", err)
+	}
+}
+
+func TestUpdateBookingStatus_SameStatusSucceeds(t *testing.T) {
+	pool, service := setupIntegrationDB(t)
+	ctx := context.Background()
+
+	userID, organizerID := createTestUserAndOrganizer(t, ctx, pool)
+
+	eventID := createTestEvent(
+		t,
+		ctx,
+		pool,
+		service,
+		userID,
+		organizerID,
+	)
+
+	response, err := service.UpdateBookingStatus(
+		ctx,
+		organizerID,
+		eventID,
+		event.UpdateBookingStatusRequest{
+			BookingStatus: "open",
+		},
+	)
+	if err != nil {
+		t.Fatalf("updating to the existing status failed: %v", err)
+	}
+
+	if response.Event.BookingStatus != "open" {
+		t.Errorf(
+			"expected booking status open, got %s",
+			response.Event.BookingStatus,
+		)
 	}
 }

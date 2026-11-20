@@ -42,6 +42,10 @@ func (h *Handler) RegisterRoutes(
 		"POST /api/v1/events",
 		authHandler.RequireAuth(h.CreateEvent),
 	)
+	mux.HandleFunc(
+		"PATCH /api/v1/events/{id}/booking-status",
+		authHandler.RequireAuth(h.UpdateBookingStatus),
+	)
 }
 
 func (h *Handler) getOrganizerProfileID(
@@ -147,6 +151,73 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusCreated, response)
 }
 
+func (h *Handler) UpdateBookingStatus(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	authUser, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	organizerProfileID, ok := h.getOrganizerProfileID(
+		w,
+		r,
+		authUser.UserID,
+	)
+	if !ok {
+		return
+	}
+
+	var req UpdateBookingStatusRequest
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Reject additional JSON values after the request object.
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	eventID := r.PathValue("id")
+
+	response, err := h.service.UpdateBookingStatus(
+		r.Context(),
+		organizerProfileID,
+		eventID,
+		req,
+	)
+	if err != nil {
+		if h.handleServiceError(w, err) {
+			return
+		}
+
+		h.logger.Error("failed to update event booking status",
+			"user_id", authUser.UserID,
+			"event_id", eventID,
+			"booking_status", req.BookingStatus,
+			"error", err,
+		)
+
+		http.Error(
+			w,
+			"an unexpected error occurred",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	h.writeJSON(w, http.StatusOK, response)
+}
+
 func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, ErrInvalidRequest):
@@ -172,6 +243,19 @@ func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
 		http.Error(
 			w,
 			"total ticket category capacity exceeds venue capacity",
+			http.StatusBadRequest,
+		)
+
+	case errors.Is(err, ErrEventNotFound):
+		http.Error(w, "event not found", http.StatusNotFound)
+
+	case errors.Is(err, ErrEventNotActive):
+		http.Error(w, "cancelled events cannot be reopened", http.StatusConflict)
+
+	case errors.Is(err, ErrInvalidBookingStatus):
+		http.Error(
+			w,
+			"booking_status must be either 'open' or 'paused'",
 			http.StatusBadRequest,
 		)
 

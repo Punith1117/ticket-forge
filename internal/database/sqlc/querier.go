@@ -61,6 +61,7 @@ type Querier interface {
 	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)
 	RevokeAllSessionsByUserID(ctx context.Context, userID pgtype.UUID) (int64, error)
 	RevokeSessionByID(ctx context.Context, id pgtype.UUID) (int64, error)
+	UpdateActiveEventBookingStatus(ctx context.Context, arg UpdateActiveEventBookingStatusParams) (Event, error)
 	UpdateRateLimitBucket(ctx context.Context, arg UpdateRateLimitBucketParams) (int64, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error)
 	ValidateAndRefreshSession(ctx context.Context, arg ValidateAndRefreshSessionParams) (Session, error)
