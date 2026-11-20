@@ -42,13 +42,18 @@ func setupIntegrationDB(t *testing.T) (*pgxpool.Pool, *auth.Service, *security.T
 		return nil, nil, nil
 	}
 
-	// Clean test tables
+	// Clean test tables in foreign-key dependency order.
 	_, err = pool.Exec(ctx, `
 		DELETE FROM password_reset_tokens;
 		DELETE FROM sessions;
-		DELETE FROM users;
 		DELETE FROM registration_verification_challenges;
 		DELETE FROM outbox_events;
+
+		DELETE FROM events;
+		DELETE FROM venue_bookings;
+		DELETE FROM organizer_profiles;
+
+		DELETE FROM users;
 	`)
 	if err != nil {
 		pool.Close()

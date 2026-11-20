@@ -118,3 +118,11 @@ RETURNING
     status,
     created_at,
     updated_at;
+
+-- name: GetVenueCapacityForBooking :one
+SELECT
+    v.capacity
+FROM venues v
+JOIN venue_bookings vb
+    ON vb.venue_id = v.id
+WHERE vb.id = $1;

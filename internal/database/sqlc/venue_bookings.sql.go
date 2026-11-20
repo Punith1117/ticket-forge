@@ -247,6 +247,22 @@ func (q *Queries) GetVenueBookingForOrganizer(ctx context.Context, arg GetVenueB
 	return i, err
 }
 
+const getVenueCapacityForBooking = `-- name: GetVenueCapacityForBooking :one
+SELECT
+    v.capacity
+FROM venues v
+JOIN venue_bookings vb
+    ON vb.venue_id = v.id
+WHERE vb.id = $1
+`
+
+func (q *Queries) GetVenueCapacityForBooking(ctx context.Context, id pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, getVenueCapacityForBooking, id)
+	var capacity int32
+	err := row.Scan(&capacity)
+	return capacity, err
+}
+
 const hasActiveEventForVenueBooking = `-- name: HasActiveEventForVenueBooking :one
 SELECT EXISTS (
     SELECT 1

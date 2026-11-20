@@ -14,6 +14,7 @@ import (
 	"github.com/Punith1117/ticket-forge/internal/auth"
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
+	"github.com/Punith1117/ticket-forge/internal/event"
 	"github.com/Punith1117/ticket-forge/internal/organizer"
 	"github.com/Punith1117/ticket-forge/internal/ratelimit"
 	"github.com/Punith1117/ticket-forge/internal/security"
@@ -139,10 +140,26 @@ func main() {
 		organizerService,
 		logger,
 	)
+
+	eventService, err := event.NewService(pool)
+	if err != nil {
+		logger.Error("Failed to initialize event service", "error", err)
+		os.Exit(1)
+	}
+
+	eventHandler := event.NewHandler(
+		eventService,
+		organizerService,
+		logger,
+	)
+
 	mux := http.NewServeMux()
+
 	authHandler.RegisterRoutes(mux)
 	organizerHandler.RegisterRoutes(mux, authHandler)
 	venueBookingHandler.RegisterRoutes(mux, authHandler)
+	eventHandler.RegisterRoutes(mux, authHandler)
+
 	// Health check endpoint
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

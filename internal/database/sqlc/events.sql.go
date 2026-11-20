@@ -18,24 +18,20 @@ INSERT INTO events (
     title,
     description,
     status,
-    booking_status,
-    sales_start_at,
-    sales_end_at
+    booking_status
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8
+    $1, $2, $3, $4, $5, $6
 )
-RETURNING id, organizer_profile_id, title, description, status, booking_status, sales_start_at, sales_end_at, created_at, updated_at, venue_booking_id
+RETURNING id, organizer_profile_id, title, description, status, booking_status, created_at, updated_at, venue_booking_id
 `
 
 type CreateEventParams struct {
-	OrganizerProfileID pgtype.UUID        `db:"organizer_profile_id" json:"organizer_profile_id"`
-	VenueBookingID     pgtype.UUID        `db:"venue_booking_id" json:"venue_booking_id"`
-	Title              string             `db:"title" json:"title"`
-	Description        string             `db:"description" json:"description"`
-	Status             string             `db:"status" json:"status"`
-	BookingStatus      string             `db:"booking_status" json:"booking_status"`
-	SalesStartAt       pgtype.Timestamptz `db:"sales_start_at" json:"sales_start_at"`
-	SalesEndAt         pgtype.Timestamptz `db:"sales_end_at" json:"sales_end_at"`
+	OrganizerProfileID pgtype.UUID `db:"organizer_profile_id" json:"organizer_profile_id"`
+	VenueBookingID     pgtype.UUID `db:"venue_booking_id" json:"venue_booking_id"`
+	Title              string      `db:"title" json:"title"`
+	Description        string      `db:"description" json:"description"`
+	Status             string      `db:"status" json:"status"`
+	BookingStatus      string      `db:"booking_status" json:"booking_status"`
 }
 
 func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error) {
@@ -46,8 +42,6 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		arg.Description,
 		arg.Status,
 		arg.BookingStatus,
-		arg.SalesStartAt,
-		arg.SalesEndAt,
 	)
 	var i Event
 	err := row.Scan(
@@ -57,8 +51,73 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 		&i.Description,
 		&i.Status,
 		&i.BookingStatus,
-		&i.SalesStartAt,
-		&i.SalesEndAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.VenueBookingID,
+	)
+	return i, err
+}
+
+const createTicketCategory = `-- name: CreateTicketCategory :one
+INSERT INTO ticket_categories (
+    event_id,
+    name,
+    price_minor,
+    currency,
+    capacity
+) VALUES (
+$1, $2, $3, 'INR', $4
+)
+RETURNING id, event_id, name, price_minor, currency, capacity, is_active, created_at, updated_at
+`
+
+type CreateTicketCategoryParams struct {
+	EventID    pgtype.UUID `db:"event_id" json:"event_id"`
+	Name       string      `db:"name" json:"name"`
+	PriceMinor int64       `db:"price_minor" json:"price_minor"`
+	Capacity   int32       `db:"capacity" json:"capacity"`
+}
+
+func (q *Queries) CreateTicketCategory(ctx context.Context, arg CreateTicketCategoryParams) (TicketCategory, error) {
+	row := q.db.QueryRow(ctx, createTicketCategory,
+		arg.EventID,
+		arg.Name,
+		arg.PriceMinor,
+		arg.Capacity,
+	)
+	var i TicketCategory
+	err := row.Scan(
+		&i.ID,
+		&i.EventID,
+		&i.Name,
+		&i.PriceMinor,
+		&i.Currency,
+		&i.Capacity,
+		&i.IsActive,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getActiveEventByVenueBookingID = `-- name: GetActiveEventByVenueBookingID :one
+SELECT id, organizer_profile_id, title, description, status, booking_status, created_at, updated_at, venue_booking_id
+FROM events
+WHERE venue_booking_id = $1
+  AND status = 'active'
+LIMIT 1
+`
+
+func (q *Queries) GetActiveEventByVenueBookingID(ctx context.Context, venueBookingID pgtype.UUID) (Event, error) {
+	row := q.db.QueryRow(ctx, getActiveEventByVenueBookingID, venueBookingID)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizerProfileID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.BookingStatus,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.VenueBookingID,
@@ -67,7 +126,7 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) (Event
 }
 
 const getEventByID = `-- name: GetEventByID :one
-SELECT id, organizer_profile_id, title, description, status, booking_status, sales_start_at, sales_end_at, created_at, updated_at, venue_booking_id
+SELECT id, organizer_profile_id, title, description, status, booking_status, created_at, updated_at, venue_booking_id
 FROM events
 WHERE id = $1
 LIMIT 1
@@ -83,8 +142,6 @@ func (q *Queries) GetEventByID(ctx context.Context, id pgtype.UUID) (Event, erro
 		&i.Description,
 		&i.Status,
 		&i.BookingStatus,
-		&i.SalesStartAt,
-		&i.SalesEndAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.VenueBookingID,
@@ -93,7 +150,7 @@ func (q *Queries) GetEventByID(ctx context.Context, id pgtype.UUID) (Event, erro
 }
 
 const listAllEventsByVenue = `-- name: ListAllEventsByVenue :many
-SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.sales_start_at, e.sales_end_at, e.created_at, e.updated_at, e.venue_booking_id
+SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.created_at, e.updated_at, e.venue_booking_id
 FROM events e
 JOIN venue_bookings vb
     ON vb.id = e.venue_booking_id
@@ -117,8 +174,6 @@ func (q *Queries) ListAllEventsByVenue(ctx context.Context, venueID pgtype.UUID)
 			&i.Description,
 			&i.Status,
 			&i.BookingStatus,
-			&i.SalesStartAt,
-			&i.SalesEndAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.VenueBookingID,
@@ -134,7 +189,7 @@ func (q *Queries) ListAllEventsByVenue(ctx context.Context, venueID pgtype.UUID)
 }
 
 const listPublicEventsByVenue = `-- name: ListPublicEventsByVenue :many
-SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.sales_start_at, e.sales_end_at, e.created_at, e.updated_at, e.venue_booking_id
+SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.created_at, e.updated_at, e.venue_booking_id
 FROM events e
 JOIN venue_bookings vb
     ON vb.id = e.venue_booking_id
@@ -159,8 +214,6 @@ func (q *Queries) ListPublicEventsByVenue(ctx context.Context, venueID pgtype.UU
 			&i.Description,
 			&i.Status,
 			&i.BookingStatus,
-			&i.SalesStartAt,
-			&i.SalesEndAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.VenueBookingID,

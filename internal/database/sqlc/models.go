@@ -28,8 +28,6 @@ type Event struct {
 	Description        string             `db:"description" json:"description"`
 	Status             string             `db:"status" json:"status"`
 	BookingStatus      string             `db:"booking_status" json:"booking_status"`
-	SalesStartAt       pgtype.Timestamptz `db:"sales_start_at" json:"sales_start_at"`
-	SalesEndAt         pgtype.Timestamptz `db:"sales_end_at" json:"sales_end_at"`
 	CreatedAt          pgtype.Timestamptz `db:"created_at" json:"created_at"`
 	UpdatedAt          pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
 	VenueBookingID     pgtype.UUID        `db:"venue_booking_id" json:"venue_booking_id"`
