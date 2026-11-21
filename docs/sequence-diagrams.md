@@ -363,46 +363,74 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    actor C as Customer
-    participant API as Go API
+    autonumber
+
+    actor User
+    participant FE as Frontend
+    participant API as TicketForge API
     participant DB as PostgreSQL
+    participant Worker as Expiration Worker
 
-    C->>API: POST /api/v1/reservations + Idempotency-Key
+    User->>FE: Select one ticket category and quantity
+    FE->>API: POST /api/v1/reservations
 
-    API->>API: Authenticate and validate request
+    Note over FE,API: Request contains one ticket_category_id and quantity
 
-    API->>DB: Begin transaction
-    API->>DB: Check idempotency record
+    API->>API: Authenticate user
+    API->>API: Validate request and quantity
 
-    alt Existing key with same request
-        DB-->>API: Stored result
-        API-->>C: Return original result
+    API->>DB: BEGIN
 
-    else Existing key with different request
-        DB-->>API: Request hash mismatch
-        API->>DB: Rollback
-        API-->>C: 409 Idempotency key conflict
+    API->>DB: SELECT event FOR UPDATE
+    DB-->>API: Event details
 
-    else New operation
-        API->>DB: Lock event
-        API->>DB: Validate event is active
-        API->>DB: Validate booking availability and sales window
-        API->>DB: Lock and validate ticket category
-        API->>DB: Read current category price
-        API->>DB: Atomically allocate inventory
+    API->>API: Check event is active and booking_status is open
 
-        alt Inventory available and category eligible
-            API->>DB: Insert Held reservation with price snapshot
-            API->>DB: Insert idempotency result
-            API->>DB: Commit
+    alt Event unavailable or booking paused
+        API->>DB: ROLLBACK
+        API-->>FE: Reject reservation
+        FE-->>User: Show event unavailable
+    else Event accepts reservations
 
-            API-->>C: 201 Reservation + expires_at + amount
+        API->>DB: SELECT inventory row FOR UPDATE
+    DB-->>API: Capacity, confirmed_quantity, held_quantity
 
-        else Inventory unavailable or booking not permitted
-            API->>DB: Rollback or persist defined failure result
-            API-->>C: 409 Reservation unavailable
+        Note over API,DB: Inventory row is locked to serialize competing requests for this ticket category
+
+        API->>DB: Find expired held reservations affecting this category
+        API->>DB: Lock eligible reservation rows using FOR UPDATE SKIP LOCKED
+
+        opt Expired reservations found
+            API->>DB: Mark claimed reservations expired
+            API->>DB: Release their held inventory
+        end
+
+        API->>DB: Calculate available inventory for the requested category
+
+        alt Insufficient inventory
+            API->>DB: ROLLBACK
+            API-->>FE: Insufficient inventory
+            FE-->>User: Show unavailable quantity
+        else Sufficient inventory
+
+            API->>DB: INSERT reservation with status held
+            Note over API,DB: expires_at = database time + 5 minutes
+
+            API->>DB: INSERT reservation_item
+            API->>DB: Increment held_quantity
+
+            API->>DB: COMMIT
+
+            API-->>FE: reservation_id, status, expires_at, amount
+            FE-->>User: Show reservation and countdown
         end
     end
+
+    Note over Worker,DB: Independently, the worker periodically claims expired holds
+    Worker->>DB: Find overdue held reservations
+    Worker->>DB: Claim rows using FOR UPDATE SKIP LOCKED
+    Worker->>DB: Release inventory and mark reservations expired
+    Worker->>DB: COMMIT
 ```
 
 ---
@@ -411,58 +439,107 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    actor C as Customer
-    participant API as Go API
+    autonumber
+
+    actor User
+    participant FE as Frontend
+    participant API as TicketForge API
     participant DB as PostgreSQL
-    participant Pay as Payment Simulator
+    participant PP as Payment Provider
 
-    C->>API: POST /api/v1/reservations/{id}/confirm
-    Note over C,API: Include Idempotency-Key header
+    User->>FE: Click Pay
+    FE->>API: POST /api/v1/reservations/{id}/checkout
 
-    API->>API: Authenticate and validate ownership
+    API->>DB: Read reservation and verify ownership
+    DB-->>API: Reservation details
 
-    API->>DB: Begin transaction
-    API->>DB: Check idempotency record
+    API->>API: Check status is held and expires_at > database time
 
-    alt Existing key with same request
-        DB-->>API: Stored result
-        API-->>C: Return original result
+    alt Reservation expired or unavailable
+        API-->>FE: Checkout rejected
+        FE-->>User: Show reservation expired
+    else Reservation eligible
+        API->>PP: Create payment order/session
+        PP-->>API: Provider order ID and checkout details
 
-    else New operation
-        API->>DB: Identify reservation's event
-        API->>DB: Lock event
-        API->>DB: Lock reservation
-        API->>DB: Validate reservation ownership and state
-        API->>DB: Check expiry and event lifecycle
+        API->>DB: BEGIN
+        API->>DB: Create internal payment record
+        API->>DB: Save provider order reference
+        API->>DB: COMMIT
 
-        alt Reservation is eligible
-            API->>Pay: Execute simulated payment
-            Pay-->>API: Payment result
+        API-->>FE: Payment ID and checkout details
+        FE->>PP: Open provider checkout
+        PP-->>FE: Display payment interface
 
-            alt Payment succeeds
-                API->>DB: Mark reservation Confirmed
-                API->>DB: Move inventory from reserved to sold
-                API->>DB: Insert Booking using price snapshot
-                API->>DB: Insert successful PaymentAttempt
-                API->>DB: Insert OutboxEvent
-                API->>DB: Store idempotency result
-                API->>DB: Commit
+        User->>PP: Complete payment
 
-                API-->>C: Booking confirmed
+        PP->>PP: Process payment
 
-            else Payment fails
-                API->>DB: Insert failed PaymentAttempt
-                API->>DB: Keep reservation Held
-                API->>DB: Store idempotency result
-                API->>DB: Commit
+        PP->>API: Payment webhook notification
 
-                API-->>C: Payment failed. Retry allowed before expiry
+        API->>API: Verify webhook signature
+        API->>API: Parse and validate provider event
+
+        alt Invalid signature or malformed webhook
+            API-->>PP: Reject webhook
+        else Valid webhook
+            API->>DB: BEGIN
+
+            API->>DB: Check webhook event ID for duplicate delivery
+
+            alt Webhook already processed
+                API->>DB: COMMIT or finish idempotent acknowledgement
+                API-->>PP: Acknowledge duplicate
+            else New webhook
+                API->>DB: Resolve event, reservation and inventory IDs
+                API->>DB: Lock event row
+                API->>DB: Lock inventory rows in deterministic order
+                API->>DB: Lock reservation row
+                API->>DB: Lock payment row
+
+                API->>API: Recheck event, reservation and expiry
+                API->>API: Verify payment amount and currency
+
+                alt Payment captured and reservation eligible
+                    API->>DB: Record payment as captured
+                    API->>DB: Change reservation held to confirmed
+                    API->>DB: Decrement held_quantity
+                    API->>DB: Increment confirmed_quantity
+                    API->>DB: Record webhook event as processed
+                    API->>DB: COMMIT
+
+                    API-->>PP: Acknowledge webhook
+                else Payment captured but reservation not eligible
+                    API->>DB: Record payment as captured
+                    API->>DB: Create refund job in outbox
+                    API->>DB: Record webhook event as processed
+                    API->>DB: COMMIT
+
+                    API-->>PP: Acknowledge webhook
+                else Payment failed
+                    API->>DB: Record payment as failed
+                    API->>DB: Record webhook event as processed
+                    API->>DB: COMMIT
+
+                    API-->>PP: Acknowledge webhook
+                end
             end
-
-        else Reservation expired or event unavailable
-            API->>DB: Rollback
-            API-->>C: Reservation no longer eligible
         end
+    end
+
+    loop Every 2-3 seconds while reservation is non-terminal
+        FE->>API: GET /api/v1/reservations/{id}
+        API->>DB: Read reservation status
+        DB-->>API: Current reservation state
+        API-->>FE: Reservation status
+    end
+
+    alt Reservation confirmed
+        FE-->>User: Display confirmed tickets
+    else Reservation expired or cancelled
+        FE-->>User: Display reservation unavailable
+    else Payment still processing
+        FE-->>User: Continue waiting
     end
 ```
 
@@ -472,25 +549,42 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant W as Expiration Worker
+    autonumber
+
+    participant Scheduler as Worker Scheduler
+    participant Worker as Expiration Worker
     participant DB as PostgreSQL
 
-    W->>DB: Find and claim expired Held reservations
-    Note over DB: Claim using row locking and SKIP LOCKED
-    DB-->>W: Claimed reservation IDs
+    loop Every few seconds
+        Scheduler->>Worker: Trigger expiration batch
 
-    loop Each claimed reservation
-        W->>DB: Begin transaction
-        W->>DB: Lock and recheck reservation state and expiry
+        Worker->>DB: Find candidate reservation IDs
+        Note over Worker,DB: status = held AND expires_at <= database time
 
-        alt Still Held and expired
-            W->>DB: Transition Held -> Expired
-            W->>DB: Release reserved inventory
-            W->>DB: Insert ReservationExpired outbox event
-            W->>DB: Commit
+        DB-->>Worker: Candidate reservation IDs
 
-        else Already processed or no longer eligible
-            W->>DB: Rollback or release claim
+        loop For each candidate reservation
+            Worker->>DB: BEGIN
+
+            Worker->>DB: Read event and ticket category IDs
+            Worker->>DB: Lock event row
+            Worker->>DB: Lock inventory rows in deterministic order
+            Worker->>DB: Lock reservation row
+
+            Worker->>DB: Recheck status and expires_at
+
+            alt Reservation is still held and expired
+                Worker->>DB: Update reservation status to expired
+                Worker->>DB: Decrement held_quantity for each item
+                Worker->>DB: COMMIT
+                Note over Worker,DB: Inventory is now available again
+            else Reservation was already confirmed, cancelled or processed
+                Worker->>DB: ROLLBACK
+                Note over Worker,DB: No inventory changes
+            else Reservation deadline has not passed
+                Worker->>DB: ROLLBACK
+                Note over Worker,DB: No inventory changes
+            end
         end
     end
 ```

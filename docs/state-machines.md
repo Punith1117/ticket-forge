@@ -293,17 +293,58 @@ A booking is created only after successful reservation confirmation.
 - A successful refund does not change the booking's historical confirmation state.
 - Refunding a booking does not restore sold inventory.
 
-## Simulated Payment Lifecycle
+## Payment Lifecycle
+
+### Payment attempt state
 
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: Payment attempt created
 
-    Pending --> Succeeded: Simulation succeeds
-    Pending --> Failed: Simulation fails
+    Pending --> Succeeded: Payment verified as successful
+    Pending --> Failed: Payment verified as failed
 
     Succeeded --> [*]
     Failed --> [*]
+```
+
+### Payment provider session state
+
+```mermaid
+stateDiagram-v2
+    [*] --> Creating: Create checkout session
+
+    Creating --> Created: Provider returns session ID
+    Creating --> CreationFailed: Provider request fails
+
+    Created --> Processing: Customer starts payment
+    Created --> Expired: Provider session expires
+
+    Processing --> Completed: Provider completes payment
+    Processing --> Failed: Provider reports failure
+    Processing --> Expired: Session expires or is abandoned
+
+    Completed --> [*]
+    Failed --> [*]
+    Expired --> [*]
+    CreationFailed --> [*]
+```
+
+### Late or ineligible payment
+
+```mermaid
+stateDiagram-v2
+    [*] --> PaymentSucceeded
+
+    PaymentSucceeded --> ConfirmationEligible: Reservation held, unexpired, event active
+    PaymentSucceeded --> RefundRequired: Reservation expired or cancelled
+    PaymentSucceeded --> RefundRequired: Event cancelled
+
+    ConfirmationEligible --> BookingConfirmed: Atomic confirmation succeeds
+    ConfirmationEligible --> RefundRequired: Eligibility lost during processing
+
+    BookingConfirmed --> [*]
+    RefundRequired --> [*]
 ```
 
 A reservation may have multiple payment attempts.
