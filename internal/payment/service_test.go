@@ -50,7 +50,7 @@ func (s *stubProvider) VerifyWebhook(
 
 func TestService_Unit_Validation(t *testing.T) {
 	t.Run("Nil dependencies return error", func(t *testing.T) {
-		_, err := payment.NewService(nil, nil, nil)
+		_, err := payment.NewService(nil, nil, nil, nil)
 		if err == nil {
 			t.Error("expected error with nil pool, got nil")
 		}

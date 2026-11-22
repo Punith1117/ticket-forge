@@ -139,7 +139,7 @@ func setupPaymentIntegrationDB(t *testing.T) *paymentTestFixture {
 		t.Fatalf("failed to initialize simulator provider: %v", err)
 	}
 
-	paymentService, err := payment.NewService(pool, paymentRepo, simProvider)
+	paymentService, err := payment.NewService(pool, paymentRepo, simProvider, bookingService)
 	if err != nil {
 		t.Fatalf("failed to initialize payment service: %v", err)
 	}
@@ -487,35 +487,39 @@ func TestPaymentWebhook_FullSimulatedHTTPFlow(t *testing.T) {
 		t.Error("expected completed_at timestamp to be set")
 	}
 
-	// 5. Explicit scope verification:
-	// - Reservation remains Held
+	// 5. Confirmation verification:
+	// - Reservation transitions to Confirmed
 	var resStatus string
 	err = f.pool.QueryRow(ctx, `SELECT status FROM reservations WHERE id = $1`, res.ID).Scan(&resStatus)
 	if err != nil {
 		t.Fatalf("failed to query reservation: %v", err)
 	}
-	if resStatus != "held" {
-		t.Errorf("milestone requirement: reservation must remain held, got %s", resStatus)
+	if resStatus != "confirmed" {
+		t.Errorf("expected reservation status confirmed, got %s", resStatus)
 	}
 
-	// - No booking is created
+	// - Exactly one booking is created
 	var bookingCount int
-	err = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	var bookingQuantity int32
+	err = f.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(quantity), 0) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount, &bookingQuantity)
 	if err != nil {
 		t.Fatalf("failed to query bookings: %v", err)
 	}
-	if bookingCount != 0 {
-		t.Errorf("milestone requirement: no bookings should be created, found %d", bookingCount)
+	if bookingCount != 1 {
+		t.Errorf("expected exactly 1 booking to be created, found %d", bookingCount)
+	}
+	if bookingQuantity != 2 {
+		t.Errorf("expected booking quantity 2, got %d", bookingQuantity)
 	}
 
-	// - Inventory reserved/sold counters remain unchanged
+	// - Inventory reserved moved to sold
 	var reservedQty, soldQty int32
 	err = f.pool.QueryRow(ctx, `SELECT reserved_quantity, sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&reservedQty, &soldQty)
 	if err != nil {
 		t.Fatalf("failed to query inventory: %v", err)
 	}
-	if reservedQty != 2 || soldQty != 0 {
-		t.Errorf("milestone requirement: inventory counters unchanged (reserved=2, sold=0), got reserved=%d, sold=%d", reservedQty, soldQty)
+	if reservedQty != 0 || soldQty != 2 {
+		t.Errorf("expected inventory counters (reserved=0, sold=2), got reserved=%d, sold=%d", reservedQty, soldQty)
 	}
 }
 
@@ -822,34 +826,34 @@ func TestHostedCheckout_FullHTTPFlow(t *testing.T) {
 			t.Error("expected completed_at to be set")
 		}
 
-		// Verify reservation remains held (milestone boundary)
+		// Verify reservation is confirmed
 		var resStatus string
 		err = f.pool.QueryRow(ctx, `SELECT status FROM reservations WHERE id = $1`, res.ID).Scan(&resStatus)
 		if err != nil {
 			t.Fatalf("failed to query reservation: %v", err)
 		}
-		if resStatus != "held" {
-			t.Errorf("reservation must remain held, got %s", resStatus)
+		if resStatus != "confirmed" {
+			t.Errorf("expected reservation status confirmed, got %s", resStatus)
 		}
 
-		// Verify no bookings created
+		// Verify exactly one booking created
 		var bookingCount int
 		err = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
 		if err != nil {
 			t.Fatalf("failed to query bookings: %v", err)
 		}
-		if bookingCount != 0 {
-			t.Errorf("no bookings should be created, found %d", bookingCount)
+		if bookingCount != 1 {
+			t.Errorf("expected exactly 1 booking to be created, found %d", bookingCount)
 		}
 
-		// Verify inventory counters unchanged
+		// Verify inventory counters updated: reserved moved to sold
 		var reservedQty, soldQty int32
 		err = f.pool.QueryRow(ctx, `SELECT reserved_quantity, sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&reservedQty, &soldQty)
 		if err != nil {
 			t.Fatalf("failed to query inventory: %v", err)
 		}
-		if reservedQty != 2 || soldQty != 0 {
-			t.Errorf("inventory unchanged (reserved=2, sold=0), got reserved=%d, sold=%d", reservedQty, soldQty)
+		if reservedQty != 0 || soldQty != 2 {
+			t.Errorf("expected inventory (reserved=0, sold=2), got reserved=%d, sold=%d", reservedQty, soldQty)
 		}
 	})
 
@@ -1040,6 +1044,25 @@ func TestHostedCheckout_FormEncodedSubmission(t *testing.T) {
 	if attempt.Status != "succeeded" {
 		t.Errorf("expected status succeeded, got %s", attempt.Status)
 	}
+
+	// Verify reservation confirmed and booking created
+	var resStatus string
+	err = f.pool.QueryRow(ctx, `SELECT status FROM reservations WHERE id = $1`, res.ID).Scan(&resStatus)
+	if err != nil {
+		t.Fatalf("failed to query reservation: %v", err)
+	}
+	if resStatus != "confirmed" {
+		t.Errorf("expected reservation status confirmed, got %s", resStatus)
+	}
+
+	var bookingCount int
+	err = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if err != nil {
+		t.Fatalf("failed to query bookings: %v", err)
+	}
+	if bookingCount != 1 {
+		t.Errorf("expected 1 booking, got %d", bookingCount)
+	}
 }
 
 // testReservationChecker implements simulator.ReservationChecker using a real DB pool for integration tests.
@@ -1130,4 +1153,375 @@ func TestWebhookHandler_AuthenticationAndValidation(t *testing.T) {
 			t.Errorf("expected 404 Not Found, got %d", rec.Code)
 		}
 	})
+}
+
+func TestPaymentConfirmation_LatePaymentEnqueuesRefund(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 2)
+	checkoutResp, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("checkout failed: %v", err)
+	}
+
+	attempt, err := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
+	if err != nil {
+		t.Fatalf("get attempt failed: %v", err)
+	}
+
+	// 1. Artificially expire the reservation (simulating time passing before payment provider webhook)
+	_, err = f.pool.Exec(ctx, `UPDATE reservations SET expires_at = now() - interval '10 seconds' WHERE id = $1`, res.ID)
+	if err != nil {
+		t.Fatalf("failed to artificially expire reservation: %v", err)
+	}
+
+	// 2. Late successful webhook arrives
+	lateEvent := payment.WebhookEvent{
+		EventID:                  "evt_late_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   attempt.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_late_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	}
+
+	err = f.paymentService.ProcessWebhookEvent(ctx, lateEvent)
+	if err != nil {
+		t.Fatalf("ProcessWebhookEvent should succeed, got: %v", err)
+	}
+
+	// 3. Payment attempt MUST be marked succeeded (we captured money)
+	updatedAttempt, err := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
+	if err != nil {
+		t.Fatalf("get updated attempt: %v", err)
+	}
+	if updatedAttempt.Status != "succeeded" {
+		t.Errorf("expected attempt status succeeded, got %s", updatedAttempt.Status)
+	}
+
+	// 4. Reservation must NOT be confirmed
+	var resStatus string
+	err = f.pool.QueryRow(ctx, `SELECT status FROM reservations WHERE id = $1`, res.ID).Scan(&resStatus)
+	if err != nil {
+		t.Fatalf("query reservation: %v", err)
+	}
+	if resStatus == "confirmed" {
+		t.Errorf("expired reservation must not be confirmed, got %s", resStatus)
+	}
+
+	// 5. No booking must be created
+	var bookingCount int
+	err = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if err != nil {
+		t.Fatalf("query bookings: %v", err)
+	}
+	if bookingCount != 0 {
+		t.Errorf("no booking should be created for late payment, got %d", bookingCount)
+	}
+
+	// 6. Inventory counters must NOT be moved to sold
+	var reservedQty, soldQty int32
+	err = f.pool.QueryRow(ctx, `SELECT reserved_quantity, sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&reservedQty, &soldQty)
+	if err != nil {
+		t.Fatalf("query inventory: %v", err)
+	}
+	if soldQty != 0 {
+		t.Errorf("sold quantity must remain 0, got %d", soldQty)
+	}
+
+	// 7. Refund must be enqueued with status = 'pending' and booking_id IS NULL
+	var refundID string
+	var refundStatus string
+	var refundAmount int64
+	var refundBookingID *string
+	err = f.pool.QueryRow(ctx, `
+		SELECT id::text, status, amount_minor, booking_id::text
+		FROM refunds
+		WHERE payment_attempt_id = $1
+	`, attempt.ID).Scan(&refundID, &refundStatus, &refundAmount, &refundBookingID)
+	if err != nil {
+		t.Fatalf("failed to query refund for late payment: %v", err)
+	}
+	if refundStatus != "pending" {
+		t.Errorf("expected refund status pending, got %s", refundStatus)
+	}
+	if refundAmount != res.TotalPriceMinor {
+		t.Errorf("expected refund amount %d, got %d", res.TotalPriceMinor, refundAmount)
+	}
+	if refundBookingID != nil {
+		t.Errorf("expected refund booking_id to be NULL, got %v", *refundBookingID)
+	}
+}
+
+func TestPaymentConfirmation_CancelledEventEnqueuesRefund(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
+	checkoutResp, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("checkout failed: %v", err)
+	}
+
+	attempt, _ := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
+
+	// Cancel the event while payment is in flight
+	_, err = f.pool.Exec(ctx, `UPDATE events SET status = 'cancelled' WHERE id = $1`, f.eventID)
+	if err != nil {
+		t.Fatalf("failed to cancel event: %v", err)
+	}
+
+	// Webhook reports success
+	event := payment.WebhookEvent{
+		EventID:                  "evt_cancel_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   attempt.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_cancel_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	}
+
+	err = f.paymentService.ProcessWebhookEvent(ctx, event)
+	if err != nil {
+		t.Fatalf("ProcessWebhookEvent failed: %v", err)
+	}
+
+	// Payment attempt succeeded
+	updatedAttempt, _ := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
+	if updatedAttempt.Status != "succeeded" {
+		t.Errorf("expected attempt succeeded, got %s", updatedAttempt.Status)
+	}
+
+	// Reservation must NOT be confirmed
+	var resStatus string
+	_ = f.pool.QueryRow(ctx, `SELECT status FROM reservations WHERE id = $1`, res.ID).Scan(&resStatus)
+	if resStatus == "confirmed" {
+		t.Errorf("cancelled event must not allow reservation confirmation")
+	}
+
+	// No booking created
+	var bookingCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if bookingCount != 0 {
+		t.Errorf("no booking should be created for cancelled event")
+	}
+
+	// Refund enqueued
+	var refundStatus string
+	err = f.pool.QueryRow(ctx, `SELECT status FROM refunds WHERE payment_attempt_id = $1`, attempt.ID).Scan(&refundStatus)
+	if err != nil {
+		t.Fatalf("expected refund record: %v", err)
+	}
+	if refundStatus != "pending" {
+		t.Errorf("expected pending refund, got %s", refundStatus)
+	}
+}
+
+func TestPaymentConfirmation_PausedEventAllowsConfirmation(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 2)
+	checkoutResp, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("checkout failed: %v", err)
+	}
+
+	attempt, _ := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
+
+	// Pause event bookings while payment is in flight (ADR-016: paused bookings do not prevent held confirmation)
+	_, err = f.pool.Exec(ctx, `UPDATE events SET booking_status = 'paused' WHERE id = $1`, f.eventID)
+	if err != nil {
+		t.Fatalf("failed to pause event: %v", err)
+	}
+
+	event := payment.WebhookEvent{
+		EventID:                  "evt_paused_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   attempt.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_paused_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	}
+
+	err = f.paymentService.ProcessWebhookEvent(ctx, event)
+	if err != nil {
+		t.Fatalf("ProcessWebhookEvent failed on paused event: %v", err)
+	}
+
+	// Reservation MUST be confirmed per ADR-016
+	var resStatus string
+	_ = f.pool.QueryRow(ctx, `SELECT status FROM reservations WHERE id = $1`, res.ID).Scan(&resStatus)
+	if resStatus != "confirmed" {
+		t.Errorf("ADR-016 requirement: paused event must still confirm valid held reservation, got %s", resStatus)
+	}
+
+	// Exactly 1 booking created
+	var bookingCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if bookingCount != 1 {
+		t.Errorf("expected 1 booking, got %d", bookingCount)
+	}
+
+	// Inventory converted: reserved=0, sold=2
+	var reservedQty, soldQty int32
+	_ = f.pool.QueryRow(ctx, `SELECT reserved_quantity, sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&reservedQty, &soldQty)
+	if reservedQty != 0 || soldQty != 2 {
+		t.Errorf("expected reserved=0, sold=2, got reserved=%d, sold=%d", reservedQty, soldQty)
+	}
+}
+
+func TestPaymentConfirmation_MultipleAttemptsSameReservation(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
+
+	// Create two distinct checkout sessions for the same reservation
+	sess1, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("session 1 failed: %v", err)
+	}
+	sess2, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("session 2 failed: %v", err)
+	}
+
+	att1, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess1.PaymentAttemptID)
+	att2, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess2.PaymentAttemptID)
+
+	// Attempt 1 succeeds and confirms the reservation
+	err = f.paymentService.ProcessWebhookEvent(ctx, payment.WebhookEvent{
+		EventID:                  "evt_att1_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   att1.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_att1_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("attempt 1 webhook failed: %v", err)
+	}
+
+	// Reservation confirmed and 1 booking created
+	var bookingCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if bookingCount != 1 {
+		t.Fatalf("expected 1 booking, got %d", bookingCount)
+	}
+
+	// Attempt 2 succeeds later (customer accidentally paid twice or delayed provider callback)
+	err = f.paymentService.ProcessWebhookEvent(ctx, payment.WebhookEvent{
+		EventID:                  "evt_att2_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   att2.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_att2_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("attempt 2 webhook failed: %v", err)
+	}
+
+	// Verify attempt 2 is recorded as succeeded
+	att2Updated, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess2.PaymentAttemptID)
+	if att2Updated.Status != "succeeded" {
+		t.Errorf("expected attempt 2 succeeded, got %s", att2Updated.Status)
+	}
+
+	// Verify STILL exactly 1 booking (NO duplicate booking)
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if bookingCount != 1 {
+		t.Errorf("expected still 1 booking, got %d", bookingCount)
+	}
+
+	// Verify inventory sold is still 1 (NOT 2)
+	var soldQty int32
+	_ = f.pool.QueryRow(ctx, `SELECT sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&soldQty)
+	if soldQty != 1 {
+		t.Errorf("expected sold_quantity to remain 1, got %d", soldQty)
+	}
+
+	// Verify attempt 2 was enqueued for a refund
+	var refundCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM refunds WHERE payment_attempt_id = $1`, att2.ID).Scan(&refundCount)
+	if refundCount != 1 {
+		t.Errorf("expected attempt 2 to have 1 refund record, got %d", refundCount)
+	}
+}
+
+func TestPaymentConfirmation_ConcurrentWebhooks(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 2)
+	checkoutResp, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("checkout failed: %v", err)
+	}
+
+	attempt, _ := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
+	orderRef := attempt.ProviderOrderReference.String
+	sharedEventID := "evt_concurrent_conf_" + uuid.NewString()
+	sharedPayRef := "pay_concurrent_conf_" + uuid.NewString()
+
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ev := payment.WebhookEvent{
+				EventID:                  sharedEventID,
+				Provider:                 simulator.ProviderName,
+				ProviderOrderReference:   orderRef,
+				ProviderPaymentReference: sharedPayRef,
+				Outcome:                  payment.PaymentOutcomeSucceeded,
+				EventType:                "payment.succeeded",
+				AmountMinor:              res.TotalPriceMinor,
+				Currency:                 res.Currency,
+				RawPayload:               []byte(`{}`),
+			}
+			errs[idx] = f.paymentService.ProcessWebhookEvent(context.Background(), ev)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent worker %d returned error: %v", i, err)
+		}
+	}
+
+	// Verify exactly 1 booking created
+	var bookingCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	if bookingCount != 1 {
+		t.Errorf("expected exactly 1 booking across concurrent webhooks, got %d", bookingCount)
+	}
+
+	// Verify inventory: reserved=0, sold=2
+	var reservedQty, soldQty int32
+	_ = f.pool.QueryRow(ctx, `SELECT reserved_quantity, sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&reservedQty, &soldQty)
+	if reservedQty != 0 || soldQty != 2 {
+		t.Errorf("expected reserved=0, sold=2, got reserved=%d, sold=%d", reservedQty, soldQty)
+	}
 }

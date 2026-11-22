@@ -130,3 +130,32 @@ SET
     END
 WHERE id = @id
 RETURNING *;
+
+-- ============================================================
+-- REFUNDS
+-- ============================================================
+
+-- name: CreateRefund :one
+INSERT INTO refunds (
+    id,
+    payment_attempt_id,
+    booking_id,
+    amount_minor,
+    currency,
+    status
+) VALUES (
+    @id,
+    @payment_attempt_id,
+    @booking_id,
+    @amount_minor,
+    @currency,
+    'pending'
+)
+ON CONFLICT (payment_attempt_id) DO NOTHING
+RETURNING *;
+
+-- name: GetRefundByPaymentAttemptID :one
+SELECT *
+FROM refunds
+WHERE payment_attempt_id = @payment_attempt_id
+LIMIT 1;

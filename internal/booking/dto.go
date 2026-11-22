@@ -18,3 +18,17 @@ type CreateReservationResponse struct {
 	Status           string    `json:"status"`
 	ExpiresAt        time.Time `json:"expires_at"`
 }
+
+type ConfirmationStatus string
+
+const (
+	ConfirmationStatusConfirmed  ConfirmationStatus = "confirmed"
+	ConfirmationStatusIneligible ConfirmationStatus = "ineligible"
+)
+
+type ConfirmationResult struct {
+	Status           ConfirmationStatus
+	BookingID        string
+	ReservationID    string
+	IneligibleReason error
+}

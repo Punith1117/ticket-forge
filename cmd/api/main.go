@@ -188,7 +188,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	paymentService, err := payment.NewService(pool, paymentRepo, simProvider)
+	paymentService, err := payment.NewService(pool, paymentRepo, simProvider, bookingService)
 	if err != nil {
 		logger.Error("Failed to initialize payment service", "error", err)
 		os.Exit(1)

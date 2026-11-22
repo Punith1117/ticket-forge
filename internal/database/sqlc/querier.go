@@ -15,9 +15,18 @@ type Querier interface {
 	ClaimOutboxEvents(ctx context.Context, arg ClaimOutboxEventsParams) ([]OutboxEvent, error)
 	CompleteIdempotencyRecord(ctx context.Context, arg CompleteIdempotencyRecordParams) (IdempotencyRecord, error)
 	CompleteOutboxEvent(ctx context.Context, arg CompleteOutboxEventParams) (int64, error)
+	// ============================================================
+	// RESERVATION CONFIRMATION & INVENTORY CONVERSION
+	// ============================================================
+	ConfirmReservation(ctx context.Context, id pgtype.UUID) (int64, error)
 	ConsumePasswordResetToken(ctx context.Context, id pgtype.UUID) (int64, error)
 	ConsumeRegistrationChallenge(ctx context.Context, id pgtype.UUID) (int64, error)
+	ConvertReservedToSoldInventory(ctx context.Context, arg ConvertReservedToSoldInventoryParams) (int64, error)
 	CountActiveUnfinishedVenueBookings(ctx context.Context, organizerProfileID pgtype.UUID) (int32, error)
+	// ============================================================
+	// BOOKINGS
+	// ============================================================
+	CreateBooking(ctx context.Context, arg CreateBookingParams) (Booking, error)
 	CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error)
 	CreateIdempotencyRecord(ctx context.Context, arg CreateIdempotencyRecordParams) (IdempotencyRecord, error)
 	CreateInventory(ctx context.Context, ticketCategoryID pgtype.UUID) error
@@ -31,6 +40,10 @@ type Querier interface {
 	// WEBHOOK EVENTS
 	// ============================================================
 	CreatePaymentWebhookEvent(ctx context.Context, arg CreatePaymentWebhookEventParams) (PaymentWebhookEvent, error)
+	// ============================================================
+	// REFUNDS
+	// ============================================================
+	CreateRefund(ctx context.Context, arg CreateRefundParams) (Refund, error)
 	CreateRegistrationChallenge(ctx context.Context, arg CreateRegistrationChallengeParams) (RegistrationVerificationChallenge, error)
 	// Price is snapshotted from the category inside the database.
 	// The expiry is calculated using the database clock.
@@ -53,6 +66,8 @@ type Querier interface {
 	FailPaymentAttempt(ctx context.Context, arg FailPaymentAttemptParams) (PaymentAttempt, error)
 	GetActiveEventByVenueBookingID(ctx context.Context, venueBookingID pgtype.UUID) (Event, error)
 	GetActiveVenueForBooking(ctx context.Context, id pgtype.UUID) (GetActiveVenueForBookingRow, error)
+	GetBookingByID(ctx context.Context, id pgtype.UUID) (Booking, error)
+	GetBookingByReservationID(ctx context.Context, reservationID pgtype.UUID) (Booking, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
 	// ============================================================
 	// RESERVATION EXPIRATION
@@ -71,6 +86,7 @@ type Querier interface {
 	GetPaymentWebhookEvent(ctx context.Context, arg GetPaymentWebhookEventParams) (PaymentWebhookEvent, error)
 	GetRateLimitBucket(ctx context.Context, key string) (RateLimitBucket, error)
 	GetRateLimitBucketForUpdate(ctx context.Context, key string) (GetRateLimitBucketForUpdateRow, error)
+	GetRefundByPaymentAttemptID(ctx context.Context, paymentAttemptID pgtype.UUID) (Refund, error)
 	GetRegistrationChallengeForUpdate(ctx context.Context, tokenHash string) (RegistrationVerificationChallenge, error)
 	// ============================================================
 	// RESERVATION RETRIEVAL

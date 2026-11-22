@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/database/sqlc"
 	"github.com/Punith1117/ticket-forge/internal/idempotency"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -259,4 +260,159 @@ func (s *Service) CreateReservation(
 	}
 
 	return response, nil
+}
+
+// ConfirmReservationPayment confirms a held reservation, updates inventory, and creates a booking within an existing transaction.
+func (s *Service) ConfirmReservationPayment(
+	ctx context.Context,
+	tx pgx.Tx,
+	reservationIDStr string,
+	paymentAttemptIDStr string,
+) (ConfirmationResult, error) {
+	resUUID, err := uuid.Parse(reservationIDStr)
+	if err != nil {
+		return ConfirmationResult{}, ErrReservationNotFound
+	}
+	attemptUUID, err := uuid.Parse(paymentAttemptIDStr)
+	if err != nil {
+		return ConfirmationResult{}, ErrPaymentAttemptMismatch
+	}
+
+	resDBID := pgtype.UUID{Bytes: resUUID, Valid: true}
+	attemptDBID := pgtype.UUID{Bytes: attemptUUID, Valid: true}
+
+	// 1. Identify reservation and its event
+	ref, err := s.repository.GetReservationLifecycleReference(ctx, tx, resDBID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ConfirmationResult{
+				Status:           ConfirmationStatusIneligible,
+				IneligibleReason: ErrReservationNotFound,
+			}, nil
+		}
+		return ConfirmationResult{}, fmt.Errorf("booking: get reservation lifecycle ref: %w", err)
+	}
+
+	// 2. Lock the relevant event row (Lock order: 1. Event)
+	eventRow, err := s.repository.LockEventForReservationLifecycle(ctx, tx, ref.EventID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ConfirmationResult{
+				Status:           ConfirmationStatusIneligible,
+				IneligibleReason: ErrEventNotEligible,
+			}, nil
+		}
+		return ConfirmationResult{}, fmt.Errorf("booking: lock event for lifecycle: %w", err)
+	}
+
+	// 3. Verify event is still eligible for confirmation (cancelled events reject confirmation)
+	if eventRow.Status != "active" {
+		return ConfirmationResult{
+			Status:           ConfirmationStatusIneligible,
+			IneligibleReason: ErrEventCancelled,
+		}, nil
+	}
+
+	// 4. Lock the reservation row (Lock order: 2. Reservation)
+	res, err := s.repository.GetReservationForUpdate(ctx, tx, resDBID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ConfirmationResult{
+				Status:           ConfirmationStatusIneligible,
+				IneligibleReason: ErrReservationNotFound,
+			}, nil
+		}
+		return ConfirmationResult{}, fmt.Errorf("booking: lock reservation for update: %w", err)
+	}
+
+	// 5. Verify payment attempt belongs to the reservation and has succeeded
+	attempt, err := s.repository.GetPaymentAttemptByID(ctx, tx, attemptDBID)
+	if err != nil {
+		return ConfirmationResult{}, fmt.Errorf("booking: verify payment attempt: %w", err)
+	}
+	if attempt.ReservationID != resDBID {
+		return ConfirmationResult{}, ErrPaymentAttemptMismatch
+	}
+	if attempt.Status != "succeeded" {
+		return ConfirmationResult{}, fmt.Errorf("booking: payment attempt status is %s, expected succeeded", attempt.Status)
+	}
+
+	// 6. Verify reservation is still held
+	if res.Status != "held" {
+		return ConfirmationResult{
+			Status:           ConfirmationStatusIneligible,
+			IneligibleReason: ErrReservationNotHeld,
+		}, nil
+	}
+
+	// 7. Verify reservation has not expired
+	if res.ExpiresAt.Valid && !time.Now().UTC().Before(res.ExpiresAt.Time) {
+		return ConfirmationResult{
+			Status:           ConfirmationStatusIneligible,
+			IneligibleReason: ErrReservationExpired,
+		}, nil
+	}
+
+	// 8. Lock the relevant inventory row (Lock order: 3. Inventory)
+	inv, err := s.repository.LockInventory(ctx, tx, res.TicketCategoryID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ConfirmationResult{
+				Status:           ConfirmationStatusIneligible,
+				IneligibleReason: ErrInventoryUnavailable,
+			}, nil
+		}
+		return ConfirmationResult{}, fmt.Errorf("booking: lock inventory: %w", err)
+	}
+
+	// 9. Verify inventory counters are consistent with reservation
+	if inv.ReservedQuantity < res.Quantity {
+		return ConfirmationResult{
+			Status:           ConfirmationStatusIneligible,
+			IneligibleReason: ErrInventoryInconsistent,
+		}, nil
+	}
+
+	// 10. Transition reservation from held to confirmed (conditional on held & unexpired in DB clock)
+	confirmRows, err := s.repository.ConfirmReservation(ctx, tx, resDBID)
+	if err != nil {
+		return ConfirmationResult{}, fmt.Errorf("booking: confirm reservation: %w", err)
+	}
+	if confirmRows != 1 {
+		// Clock expired or status changed
+		return ConfirmationResult{
+			Status:           ConfirmationStatusIneligible,
+			IneligibleReason: ErrReservationExpired,
+		}, nil
+	}
+
+	// 11. Convert inventory (decrement reserved, increment sold)
+	convertRows, err := s.repository.ConvertReservedToSoldInventory(ctx, tx, res.TicketCategoryID, res.Quantity)
+	if err != nil {
+		return ConfirmationResult{}, fmt.Errorf("booking: convert inventory: %w", err)
+	}
+	if convertRows != 1 {
+		return ConfirmationResult{}, fmt.Errorf("booking: convert inventory affected %d rows, expected 1", convertRows)
+	}
+
+	// 12. Create the corresponding booking
+	bookingID := uuid.New()
+	createdBooking, err := s.repository.CreateBooking(ctx, tx, sqlc.CreateBookingParams{
+		ID:               pgtype.UUID{Bytes: bookingID, Valid: true},
+		ReservationID:    res.ID,
+		CustomerID:       res.CustomerID,
+		Quantity:         res.Quantity,
+		UnitPriceMinor:   res.UnitPriceMinor,
+		TotalPriceMinor:  res.TotalPriceMinor,
+		Currency:         res.Currency,
+	})
+	if err != nil {
+		return ConfirmationResult{}, fmt.Errorf("booking: create booking: %w", err)
+	}
+
+	return ConfirmationResult{
+		Status:        ConfirmationStatusConfirmed,
+		BookingID:     uuid.UUID(createdBooking.ID.Bytes).String(),
+		ReservationID: resUUID.String(),
+	}, nil
 }

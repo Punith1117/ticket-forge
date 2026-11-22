@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/booking"
 	"github.com/Punith1117/ticket-forge/internal/database/sqlc"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -14,13 +15,28 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type Service struct {
-	pool       *pgxpool.Pool
-	repository *Repository
-	provider   Provider
+type BookingConfirmer interface {
+	ConfirmReservationPayment(
+		ctx context.Context,
+		tx pgx.Tx,
+		reservationID string,
+		paymentAttemptID string,
+	) (booking.ConfirmationResult, error)
 }
 
-func NewService(pool *pgxpool.Pool, repository *Repository, provider Provider) (*Service, error) {
+type Service struct {
+	pool             *pgxpool.Pool
+	repository       *Repository
+	provider         Provider
+	bookingConfirmer BookingConfirmer
+}
+
+func NewService(
+	pool *pgxpool.Pool,
+	repository *Repository,
+	provider Provider,
+	bookingConfirmer BookingConfirmer,
+) (*Service, error) {
 	if pool == nil {
 		return nil, errors.New("payment: database pool cannot be nil")
 	}
@@ -32,9 +48,10 @@ func NewService(pool *pgxpool.Pool, repository *Repository, provider Provider) (
 	}
 
 	return &Service{
-		pool:       pool,
-		repository: repository,
-		provider:   provider,
+		pool:             pool,
+		repository:       repository,
+		provider:         provider,
+		bookingConfirmer: bookingConfirmer,
 	}, nil
 }
 
@@ -239,7 +256,33 @@ func (s *Service) ProcessWebhookEvent(ctx context.Context, event WebhookEvent) e
 	switch attempt.Status {
 	case "succeeded":
 		// Out-of-order late failure event must not downgrade an already succeeded payment attempt
-		// Success duplicate is idempotent no-op.
+		// Success duplicate: check if confirmation or refund already happened.
+		if event.Outcome == PaymentOutcomeSucceeded && s.bookingConfirmer != nil {
+			// Check if booking or refund already recorded
+			_, bErr := s.repository.GetBookingByReservationIDTx(ctx, tx, attempt.ReservationID)
+			_, rErr := s.repository.GetRefundByPaymentAttemptIDTx(ctx, tx, attempt.ID)
+			if (bErr != nil || errors.Is(bErr, pgx.ErrNoRows)) && (rErr != nil || errors.Is(rErr, pgx.ErrNoRows)) {
+				resIDStr := uuid.UUID(attempt.ReservationID.Bytes).String()
+				attemptIDStr := uuid.UUID(attempt.ID.Bytes).String()
+				confirmResult, err := s.bookingConfirmer.ConfirmReservationPayment(ctx, tx, resIDStr, attemptIDStr)
+				if err != nil {
+					return fmt.Errorf("payment: confirm reservation on duplicate: %w", err)
+				}
+				if confirmResult.Status == booking.ConfirmationStatusIneligible {
+					refundUUID := uuid.New()
+					_, err = s.repository.CreateRefundTx(ctx, tx, sqlc.CreateRefundParams{
+						ID:               pgtype.UUID{Bytes: refundUUID, Valid: true},
+						PaymentAttemptID: attempt.ID,
+						BookingID:        pgtype.UUID{Valid: false},
+						AmountMinor:      attempt.AmountMinor,
+						Currency:         attempt.Currency,
+					})
+					if err != nil {
+						return fmt.Errorf("payment: create refund for ineligible reservation: %w", err)
+					}
+				}
+			}
+		}
 
 	case "failed":
 		if event.Outcome == PaymentOutcomeSucceeded {
@@ -248,7 +291,7 @@ func (s *Service) ProcessWebhookEvent(ctx context.Context, event WebhookEvent) e
 
 	case "pending":
 		if event.Outcome == PaymentOutcomeSucceeded {
-			_, err = s.repository.SucceedPaymentAttemptTx(ctx, tx, sqlc.SucceedPaymentAttemptParams{
+			attempt, err = s.repository.SucceedPaymentAttemptTx(ctx, tx, sqlc.SucceedPaymentAttemptParams{
 				ID: attempt.ID,
 				ProviderReference: pgtype.Text{
 					String: event.ProviderPaymentReference,
@@ -257,6 +300,32 @@ func (s *Service) ProcessWebhookEvent(ctx context.Context, event WebhookEvent) e
 			})
 			if err != nil {
 				return fmt.Errorf("payment: record successful attempt: %w", err)
+			}
+
+			// Attempt reservation confirmation and booking creation
+			if s.bookingConfirmer != nil {
+				resIDStr := uuid.UUID(attempt.ReservationID.Bytes).String()
+				attemptIDStr := uuid.UUID(attempt.ID.Bytes).String()
+				confirmResult, err := s.bookingConfirmer.ConfirmReservationPayment(ctx, tx, resIDStr, attemptIDStr)
+				if err != nil {
+					return fmt.Errorf("payment: confirm reservation: %w", err)
+				}
+
+				if confirmResult.Status == booking.ConfirmationStatusIneligible {
+					// Reservation expired, event cancelled, or reservation otherwise ineligible.
+					// Initiate/enqueue refund for this captured payment attempt.
+					refundUUID := uuid.New()
+					_, err = s.repository.CreateRefundTx(ctx, tx, sqlc.CreateRefundParams{
+						ID:               pgtype.UUID{Bytes: refundUUID, Valid: true},
+						PaymentAttemptID: attempt.ID,
+						BookingID:        pgtype.UUID{Valid: false},
+						AmountMinor:      attempt.AmountMinor,
+						Currency:         attempt.Currency,
+					})
+					if err != nil {
+						return fmt.Errorf("payment: enqueue refund for ineligible reservation: %w", err)
+					}
+				}
 			}
 		} else if event.Outcome == PaymentOutcomeFailed {
 			_, err = s.repository.FailPaymentAttemptTx(ctx, tx, sqlc.FailPaymentAttemptParams{

@@ -185,3 +185,26 @@ updated AS (
 )
 SELECT COALESCE(SUM(quantity), 0)::integer AS released_quantity
 FROM updated;
+
+-- ============================================================
+-- RESERVATION CONFIRMATION & INVENTORY CONVERSION
+-- ============================================================
+
+-- name: ConfirmReservation :execrows
+UPDATE reservations
+SET
+    status = 'confirmed',
+    updated_at = clock_timestamp()
+WHERE id = @id
+  AND status = 'held'
+  AND expires_at > clock_timestamp();
+
+-- name: ConvertReservedToSoldInventory :execrows
+UPDATE inventory
+SET
+    reserved_quantity = reserved_quantity - @quantity,
+    sold_quantity = sold_quantity + @quantity,
+    updated_at = clock_timestamp()
+WHERE ticket_category_id = @ticket_category_id
+  AND reserved_quantity >= @quantity;
+

@@ -186,3 +186,39 @@ func (r *Repository) UpdatePaymentWebhookEventStatus(
 	}
 	return event, nil
 }
+
+func (r *Repository) CreateRefundTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	arg sqlc.CreateRefundParams,
+) (sqlc.Refund, error) {
+	refund, err := sqlc.New(tx).CreateRefund(ctx, arg)
+	if err != nil {
+		return sqlc.Refund{}, fmt.Errorf("payment: create refund: %w", err)
+	}
+	return refund, nil
+}
+
+func (r *Repository) GetRefundByPaymentAttemptIDTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	attemptID pgtype.UUID,
+) (sqlc.Refund, error) {
+	refund, err := sqlc.New(tx).GetRefundByPaymentAttemptID(ctx, attemptID)
+	if err != nil {
+		return sqlc.Refund{}, fmt.Errorf("payment: get refund by payment attempt id: %w", err)
+	}
+	return refund, nil
+}
+
+func (r *Repository) GetBookingByReservationIDTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	reservationID pgtype.UUID,
+) (sqlc.Booking, error) {
+	booking, err := sqlc.New(tx).GetBookingByReservationID(ctx, reservationID)
+	if err != nil {
+		return sqlc.Booking{}, fmt.Errorf("payment: get booking by reservation id: %w", err)
+	}
+	return booking, nil
+}

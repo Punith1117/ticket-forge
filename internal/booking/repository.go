@@ -170,3 +170,103 @@ func (r *Repository) DecrementReservedInventory(
 
 	return rowsAffected, nil
 }
+
+func (r *Repository) GetReservationLifecycleReference(
+	ctx context.Context,
+	tx pgx.Tx,
+	reservationID pgtype.UUID,
+) (sqlc.GetReservationLifecycleReferenceRow, error) {
+	ref, err := sqlc.New(tx).GetReservationLifecycleReference(ctx, reservationID)
+	if err != nil {
+		return sqlc.GetReservationLifecycleReferenceRow{}, fmt.Errorf("booking: get reservation lifecycle ref: %w", err)
+	}
+	return ref, nil
+}
+
+func (r *Repository) LockEventForReservationLifecycle(
+	ctx context.Context,
+	tx pgx.Tx,
+	eventID pgtype.UUID,
+) (sqlc.LockEventForReservationLifecycleRow, error) {
+	event, err := sqlc.New(tx).LockEventForReservationLifecycle(ctx, eventID)
+	if err != nil {
+		return sqlc.LockEventForReservationLifecycleRow{}, fmt.Errorf("booking: lock event for lifecycle: %w", err)
+	}
+	return event, nil
+}
+
+func (r *Repository) GetReservationForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	reservationID pgtype.UUID,
+) (sqlc.Reservation, error) {
+	res, err := sqlc.New(tx).GetReservationForUpdate(ctx, reservationID)
+	if err != nil {
+		return sqlc.Reservation{}, fmt.Errorf("booking: get reservation for update: %w", err)
+	}
+	return res, nil
+}
+
+func (r *Repository) ConfirmReservation(
+	ctx context.Context,
+	tx pgx.Tx,
+	reservationID pgtype.UUID,
+) (int64, error) {
+	rows, err := sqlc.New(tx).ConfirmReservation(ctx, reservationID)
+	if err != nil {
+		return 0, fmt.Errorf("booking: confirm reservation: %w", err)
+	}
+	return rows, nil
+}
+
+func (r *Repository) ConvertReservedToSoldInventory(
+	ctx context.Context,
+	tx pgx.Tx,
+	categoryID pgtype.UUID,
+	quantity int32,
+) (int64, error) {
+	rows, err := sqlc.New(tx).ConvertReservedToSoldInventory(ctx, sqlc.ConvertReservedToSoldInventoryParams{
+		TicketCategoryID: categoryID,
+		Quantity:         quantity,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("booking: convert reserved to sold inventory: %w", err)
+	}
+	return rows, nil
+}
+
+func (r *Repository) CreateBooking(
+	ctx context.Context,
+	tx pgx.Tx,
+	arg sqlc.CreateBookingParams,
+) (sqlc.Booking, error) {
+	booking, err := sqlc.New(tx).CreateBooking(ctx, arg)
+	if err != nil {
+		return sqlc.Booking{}, fmt.Errorf("booking: create booking: %w", err)
+	}
+	return booking, nil
+}
+
+func (r *Repository) GetBookingByReservationID(
+	ctx context.Context,
+	tx pgx.Tx,
+	reservationID pgtype.UUID,
+) (sqlc.Booking, error) {
+	booking, err := sqlc.New(tx).GetBookingByReservationID(ctx, reservationID)
+	if err != nil {
+		return sqlc.Booking{}, fmt.Errorf("booking: get booking by reservation id: %w", err)
+	}
+	return booking, nil
+}
+
+func (r *Repository) GetPaymentAttemptByID(
+	ctx context.Context,
+	tx pgx.Tx,
+	attemptID pgtype.UUID,
+) (sqlc.PaymentAttempt, error) {
+	attempt, err := sqlc.New(tx).GetPaymentAttemptByID(ctx, attemptID)
+	if err != nil {
+		return sqlc.PaymentAttempt{}, fmt.Errorf("booking: get payment attempt by id: %w", err)
+	}
+	return attempt, nil
+}

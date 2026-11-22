@@ -14,4 +14,13 @@ var (
 	ErrInsufficientInventory     = errors.New("booking: insufficient tickets available")
 
 	ErrInventoryUnavailable = errors.New("booking: inventory record is missing")
+
+	ErrReservationNotFound    = errors.New("booking: reservation not found")
+	ErrReservationNotHeld     = errors.New("booking: reservation is not in held status")
+	ErrReservationExpired     = errors.New("booking: reservation has expired")
+	ErrEventCancelled         = errors.New("booking: event has been cancelled")
+	ErrEventNotEligible       = errors.New("booking: event is not eligible for confirmation")
+	ErrPaymentAttemptMismatch = errors.New("booking: payment attempt does not match reservation")
+	ErrInventoryInconsistent  = errors.New("booking: inventory counters are inconsistent with reservation")
+	ErrBookingAlreadyExists   = errors.New("booking: booking already exists for reservation")
 )

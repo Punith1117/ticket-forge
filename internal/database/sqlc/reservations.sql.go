@@ -11,6 +11,51 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const confirmReservation = `-- name: ConfirmReservation :execrows
+
+UPDATE reservations
+SET
+    status = 'confirmed',
+    updated_at = clock_timestamp()
+WHERE id = $1
+  AND status = 'held'
+  AND expires_at > clock_timestamp()
+`
+
+// ============================================================
+// RESERVATION CONFIRMATION & INVENTORY CONVERSION
+// ============================================================
+func (q *Queries) ConfirmReservation(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, confirmReservation, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const convertReservedToSoldInventory = `-- name: ConvertReservedToSoldInventory :execrows
+UPDATE inventory
+SET
+    reserved_quantity = reserved_quantity - $1,
+    sold_quantity = sold_quantity + $1,
+    updated_at = clock_timestamp()
+WHERE ticket_category_id = $2
+  AND reserved_quantity >= $1
+`
+
+type ConvertReservedToSoldInventoryParams struct {
+	Quantity         int32       `db:"quantity" json:"quantity"`
+	TicketCategoryID pgtype.UUID `db:"ticket_category_id" json:"ticket_category_id"`
+}
+
+func (q *Queries) ConvertReservedToSoldInventory(ctx context.Context, arg ConvertReservedToSoldInventoryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, convertReservedToSoldInventory, arg.Quantity, arg.TicketCategoryID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createReservation = `-- name: CreateReservation :one
 INSERT INTO reservations (
     customer_id,

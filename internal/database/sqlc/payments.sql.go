@@ -143,6 +143,68 @@ func (q *Queries) CreatePaymentWebhookEvent(ctx context.Context, arg CreatePayme
 	return i, err
 }
 
+const createRefund = `-- name: CreateRefund :one
+
+INSERT INTO refunds (
+    id,
+    payment_attempt_id,
+    booking_id,
+    amount_minor,
+    currency,
+    status
+) VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    $5,
+    'pending'
+)
+ON CONFLICT (payment_attempt_id) DO NOTHING
+RETURNING id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error
+`
+
+type CreateRefundParams struct {
+	ID               pgtype.UUID `db:"id" json:"id"`
+	PaymentAttemptID pgtype.UUID `db:"payment_attempt_id" json:"payment_attempt_id"`
+	BookingID        pgtype.UUID `db:"booking_id" json:"booking_id"`
+	AmountMinor      int64       `db:"amount_minor" json:"amount_minor"`
+	Currency         string      `db:"currency" json:"currency"`
+}
+
+// ============================================================
+// REFUNDS
+// ============================================================
+func (q *Queries) CreateRefund(ctx context.Context, arg CreateRefundParams) (Refund, error) {
+	row := q.db.QueryRow(ctx, createRefund,
+		arg.ID,
+		arg.PaymentAttemptID,
+		arg.BookingID,
+		arg.AmountMinor,
+		arg.Currency,
+	)
+	var i Refund
+	err := row.Scan(
+		&i.ID,
+		&i.BookingID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.CompletedAt,
+		&i.PaymentAttemptID,
+		&i.ProviderRefundReference,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.ClaimExpiresAt,
+		&i.LastAttemptAt,
+		&i.LastError,
+	)
+	return i, err
+}
+
 const failPaymentAttempt = `-- name: FailPaymentAttempt :one
 UPDATE payment_attempts
 SET
@@ -262,6 +324,37 @@ func (q *Queries) GetPaymentWebhookEvent(ctx context.Context, arg GetPaymentWebh
 		&i.ReceivedAt,
 		&i.ProcessedAt,
 		&i.ProcessingStatus,
+	)
+	return i, err
+}
+
+const getRefundByPaymentAttemptID = `-- name: GetRefundByPaymentAttemptID :one
+SELECT id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error
+FROM refunds
+WHERE payment_attempt_id = $1
+LIMIT 1
+`
+
+func (q *Queries) GetRefundByPaymentAttemptID(ctx context.Context, paymentAttemptID pgtype.UUID) (Refund, error) {
+	row := q.db.QueryRow(ctx, getRefundByPaymentAttemptID, paymentAttemptID)
+	var i Refund
+	err := row.Scan(
+		&i.ID,
+		&i.BookingID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.CompletedAt,
+		&i.PaymentAttemptID,
+		&i.ProviderRefundReference,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.ClaimExpiresAt,
+		&i.LastAttemptAt,
+		&i.LastError,
 	)
 	return i, err
 }
