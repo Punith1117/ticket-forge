@@ -233,6 +233,15 @@ func (s *Service) Create(
 			return CreateEventResponse{}, err
 		}
 
+		// Every ticket category must have an inventory record.
+		if err := s.repository.CreateInventory(
+			ctx,
+			tx,
+			createdCategory.ID,
+		); err != nil {
+			return CreateEventResponse{}, err
+		}
+
 		response.TicketCategories = append(
 			response.TicketCategories,
 			TicketCategoryResponse{

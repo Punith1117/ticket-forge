@@ -228,12 +228,10 @@ func TestInvalidStateConstraints(t *testing.T) {
 					organizer_profile_id,
 					venue_booking_id,
 					title,
-					status,
-					sales_start_at,
-					sales_end_at
+					status
 			)
-			VALUES ($1, $2, 'Invalid State Event', 'finished', $3, $4)
-	`, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour))
+			VALUES ($1, $2, 'Invalid State Event', 'finished')
+	`, orgID, venueBookingID)
 	if err == nil {
 		t.Fatal("expected check constraint violation for invalid event status, but succeeded")
 	}
@@ -263,13 +261,11 @@ func TestInvalidInventoryQuantities(t *testing.T) {
 					organizer_profile_id,
 					venue_booking_id,
 					title,
-					status,
-					sales_start_at,
-					sales_end_at
+					status
 			)
-			VALUES ($1, $2, 'Inv Test Event', 'active', $3, $4)
+			VALUES ($1, $2, 'Inv Test Event', 'active')
 			RETURNING id::text
-	`, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour)).Scan(&eventID)
+	`, orgID, venueBookingID).Scan(&eventID)
 	if err != nil {
 		t.Fatalf("failed to insert event: %v", err)
 	}
@@ -318,13 +314,11 @@ func TestUniqueReservationToBookingRelationship(t *testing.T) {
 					organizer_profile_id,
 					venue_booking_id,
 					title,
-					status,
-					sales_start_at,
-					sales_end_at
+					status
 			)
-			VALUES ($1, $2, 'Booking Unique Test Event', 'active', $3, $4)
+			VALUES ($1, $2, 'Booking Unique Test Event', 'active')
 			RETURNING id::text
-	`, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour)).Scan(&eventID)
+	`, orgID, venueBookingID).Scan(&eventID)
 	if err != nil {
 		t.Fatalf("failed to insert event: %v", err)
 	}
@@ -372,20 +366,46 @@ func TestUniqueReservationToBookingRelationship(t *testing.T) {
 		t.Fatalf("expected unique_violation (23505), got: %v", err)
 	}
 
+	// Create the first payment attempt
+	var firstPaymentAttemptID string
+	err = pool.QueryRow(ctx, `
+		INSERT INTO payment_attempts (
+			reservation_id, provider, amount_minor, currency, status
+		)
+		VALUES ($1, 'test', 10000, 'INR', 'succeeded')
+		RETURNING id::text
+	`, resID).Scan(&firstPaymentAttemptID)
+	if err != nil {
+		t.Fatalf("failed to insert first payment attempt: %v", err)
+	}
+
 	// First refund succeeds
 	_, err = pool.Exec(ctx, `
-		INSERT INTO refunds (booking_id, amount_minor, currency, status)
-		VALUES ($1, 10000, 'INR', 'pending')
-	`, bookingID)
+		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status)
+		VALUES ($1, $2, 10000, 'INR', 'pending')
+	`, bookingID, firstPaymentAttemptID)
 	if err != nil {
 		t.Fatalf("failed to insert first refund: %v", err)
 	}
 
+	// Create a separate payment attempt for the second refund
+	var secondPaymentAttemptID string
+	err = pool.QueryRow(ctx, `
+		INSERT INTO payment_attempts (
+			reservation_id, provider, amount_minor, currency, status
+		)
+		VALUES ($1, 'test', 10000, 'INR', 'succeeded')
+		RETURNING id::text
+	`, resID).Scan(&secondPaymentAttemptID)
+	if err != nil {
+		t.Fatalf("failed to insert second payment attempt: %v", err)
+	}
+
 	// Second refund for same booking MUST FAIL (unique constraint)
 	_, err = pool.Exec(ctx, `
-		INSERT INTO refunds (booking_id, amount_minor, currency, status)
-		VALUES ($1, 10000, 'INR', 'pending')
-	`, bookingID)
+		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status)
+		VALUES ($1, $2, 10000, 'INR', 'pending')
+	`, bookingID, secondPaymentAttemptID)
 	if err == nil {
 		t.Fatal("expected unique violation for second refund on same booking, but succeeded")
 	}
@@ -440,12 +460,10 @@ func TestForeignKeyRestrictions(t *testing.T) {
             organizer_profile_id,
             venue_booking_id,
             title,
-            status,
-            sales_start_at,
-            sales_end_at
+            status
         )
-        VALUES ($1, $2, 'Restrict Event', 'active', $3, $4)
-    `, orgID, venueBookingID, now.Add(-24*time.Hour), now.Add(-time.Hour))
+        VALUES ($1, $2, 'Restrict Event', 'active')
+    `, orgID, venueBookingID)
 	if err != nil {
 		t.Fatalf("failed to insert event on real venue booking: %v", err)
 	}

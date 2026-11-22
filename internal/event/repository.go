@@ -191,3 +191,16 @@ func (r *Repository) UpdateActiveEventBookingStatus(
 
 	return updatedEvent, nil
 }
+
+func (r *Repository) CreateInventory(
+	ctx context.Context,
+	tx pgx.Tx,
+	ticketCategoryID pgtype.UUID,
+) error {
+	err := sqlc.New(tx).CreateInventory(ctx, ticketCategoryID)
+	if err != nil {
+		return fmt.Errorf("event: create inventory: %w", err)
+	}
+
+	return nil
+}

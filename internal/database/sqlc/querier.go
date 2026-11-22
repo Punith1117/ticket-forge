@@ -20,19 +20,38 @@ type Querier interface {
 	CountActiveUnfinishedVenueBookings(ctx context.Context, organizerProfileID pgtype.UUID) (int32, error)
 	CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error)
 	CreateIdempotencyRecord(ctx context.Context, arg CreateIdempotencyRecordParams) (IdempotencyRecord, error)
+	CreateInventory(ctx context.Context, ticketCategoryID pgtype.UUID) error
 	CreateOrganizerProfile(ctx context.Context, id pgtype.UUID) (OrganizerProfile, error)
 	CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error)
 	CreateRegistrationChallenge(ctx context.Context, arg CreateRegistrationChallengeParams) (RegistrationVerificationChallenge, error)
+	// Price is snapshotted from the category inside the database.
+	// The expiry is calculated using the database clock.
+	CreateReservation(ctx context.Context, arg CreateReservationParams) (Reservation, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	CreateTicketCategory(ctx context.Context, arg CreateTicketCategoryParams) (TicketCategory, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
 	CreateVenue(ctx context.Context, arg CreateVenueParams) (Venue, error)
 	CreateVenueBooking(ctx context.Context, arg CreateVenueBookingParams) (CreateVenueBookingRow, error)
+	// Releases the inventory allocated to an expired reservation.
+	DecrementReservedInventory(ctx context.Context, arg DecrementReservedInventoryParams) (int64, error)
 	DeleteInactiveBuckets(ctx context.Context, arg DeleteInactiveBucketsParams) (int64, error)
+	// Claims and expires all currently expired holds for one ticket category.
+	// Must be called after locking the associated event and ticket category.
+	// Returns the total quantity that must be released from inventory.
+	ExpireExpiredReservationsForCategory(ctx context.Context, ticketCategoryID pgtype.UUID) (int32, error)
+	// Only expires a reservation that is still held and past its deadline.
+	ExpireReservation(ctx context.Context, id pgtype.UUID) (int64, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) (int64, error)
 	GetActiveEventByVenueBookingID(ctx context.Context, venueBookingID pgtype.UUID) (Event, error)
 	GetActiveVenueForBooking(ctx context.Context, id pgtype.UUID) (GetActiveVenueForBookingRow, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
+	// ============================================================
+	// RESERVATION EXPIRATION
+	// ============================================================
+	// This query only discovers candidates.
+	// It intentionally does not lock reservations.
+	// The worker locks the event first, then the reservation.
+	GetExpiredReservationCandidates(ctx context.Context, limitCount int32) ([]GetExpiredReservationCandidatesRow, error)
 	GetIdempotencyRecord(ctx context.Context, arg GetIdempotencyRecordParams) (IdempotencyRecord, error)
 	GetLatestPasswordResetTokenByUserID(ctx context.Context, userID pgtype.UUID) (PasswordResetToken, error)
 	GetLatestRegistrationChallengeByEmail(ctx context.Context, email string) (RegistrationVerificationChallenge, error)
@@ -41,7 +60,19 @@ type Querier interface {
 	GetRateLimitBucket(ctx context.Context, key string) (RateLimitBucket, error)
 	GetRateLimitBucketForUpdate(ctx context.Context, key string) (GetRateLimitBucketForUpdateRow, error)
 	GetRegistrationChallengeForUpdate(ctx context.Context, tokenHash string) (RegistrationVerificationChallenge, error)
+	// ============================================================
+	// RESERVATION RETRIEVAL
+	// ============================================================
+	GetReservationByID(ctx context.Context, id pgtype.UUID) (Reservation, error)
+	// Customers can only retrieve their own reservations.
+	GetReservationByIDForCustomer(ctx context.Context, arg GetReservationByIDForCustomerParams) (Reservation, error)
+	// Must be called after locking the associated event.
+	GetReservationForUpdate(ctx context.Context, id pgtype.UUID) (Reservation, error)
+	GetReservationLifecycleReference(ctx context.Context, id pgtype.UUID) (GetReservationLifecycleReferenceRow, error)
+	// Lightweight query for the frontend polling endpoint.
+	GetReservationStatusForCustomer(ctx context.Context, arg GetReservationStatusForCustomerParams) (GetReservationStatusForCustomerRow, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
+	GetTicketCategoryInventory(ctx context.Context, ticketCategoryID pgtype.UUID) (GetTicketCategoryInventoryRow, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (User, error)
 	GetVenueBookingByID(ctx context.Context, id pgtype.UUID) (GetVenueBookingByIDRow, error)
@@ -50,12 +81,28 @@ type Querier interface {
 	GetVenueBySlug(ctx context.Context, slug string) (Venue, error)
 	GetVenueCapacityForBooking(ctx context.Context, id pgtype.UUID) (int32, error)
 	HasActiveEventForVenueBooking(ctx context.Context, venueBookingID pgtype.UUID) (bool, error)
+	// Atomically allocates inventory, refusing to exceed category capacity.
+	IncrementReservedInventory(ctx context.Context, arg IncrementReservedInventoryParams) (int64, error)
 	InsertBucketIfNotExists(ctx context.Context, arg InsertBucketIfNotExistsParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (OutboxEvent, error)
 	ListActiveVenues(ctx context.Context) ([]Venue, error)
 	ListAllEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error)
 	ListOrganizerVenueBookings(ctx context.Context, organizerProfileID pgtype.UUID) ([]ListOrganizerVenueBookingsRow, error)
 	ListPublicEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error)
+	// Locks the category and verifies that it belongs to the event.
+	LockActiveTicketCategory(ctx context.Context, arg LockActiveTicketCategoryParams) (LockActiveTicketCategoryRow, error)
+	// ============================================================
+	// RESERVATION CREATION
+	// ============================================================
+	// Locks the event and verifies that new reservations are allowed.
+	// This must be the first lock acquired during reservation creation.
+	LockBookableEvent(ctx context.Context, eventID pgtype.UUID) (LockBookableEventRow, error)
+	// Used by expiration and confirmation workflows.
+	// Unlike LockBookableEvent, this does not require booking_status = open.
+	LockEventForReservationLifecycle(ctx context.Context, eventID pgtype.UUID) (LockEventForReservationLifecycleRow, error)
+	// Locks the inventory row and returns its current counters.
+	// Capacity is already retrieved from the locked ticket category.
+	LockInventory(ctx context.Context, ticketCategoryID pgtype.UUID) (LockInventoryRow, error)
 	LockOrganizerProfile(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	LockVenueBookingForOrganizer(ctx context.Context, arg LockVenueBookingForOrganizerParams) (LockVenueBookingForOrganizerRow, error)
 	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)

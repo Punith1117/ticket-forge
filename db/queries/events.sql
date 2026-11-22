@@ -61,3 +61,13 @@ SET
 WHERE id = $1
   AND status = 'active'
 RETURNING *;
+
+-- name: GetReservationLifecycleReference :one
+SELECT
+    r.id AS reservation_id,
+    r.ticket_category_id,
+    tc.event_id
+FROM reservations AS r
+JOIN ticket_categories AS tc
+    ON tc.id = r.ticket_category_id
+WHERE r.id = $1;

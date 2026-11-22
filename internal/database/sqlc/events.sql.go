@@ -149,6 +149,30 @@ func (q *Queries) GetEventByID(ctx context.Context, id pgtype.UUID) (Event, erro
 	return i, err
 }
 
+const getReservationLifecycleReference = `-- name: GetReservationLifecycleReference :one
+SELECT
+    r.id AS reservation_id,
+    r.ticket_category_id,
+    tc.event_id
+FROM reservations AS r
+JOIN ticket_categories AS tc
+    ON tc.id = r.ticket_category_id
+WHERE r.id = $1
+`
+
+type GetReservationLifecycleReferenceRow struct {
+	ReservationID    pgtype.UUID `db:"reservation_id" json:"reservation_id"`
+	TicketCategoryID pgtype.UUID `db:"ticket_category_id" json:"ticket_category_id"`
+	EventID          pgtype.UUID `db:"event_id" json:"event_id"`
+}
+
+func (q *Queries) GetReservationLifecycleReference(ctx context.Context, id pgtype.UUID) (GetReservationLifecycleReferenceRow, error) {
+	row := q.db.QueryRow(ctx, getReservationLifecycleReference, id)
+	var i GetReservationLifecycleReferenceRow
+	err := row.Scan(&i.ReservationID, &i.TicketCategoryID, &i.EventID)
+	return i, err
+}
+
 const listAllEventsByVenue = `-- name: ListAllEventsByVenue :many
 SELECT e.id, e.organizer_profile_id, e.title, e.description, e.status, e.booking_status, e.created_at, e.updated_at, e.venue_booking_id
 FROM events e

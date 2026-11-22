@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
+	"github.com/Punith1117/ticket-forge/internal/booking"
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
 	"github.com/Punith1117/ticket-forge/internal/event"
@@ -153,12 +154,21 @@ func main() {
 		logger,
 	)
 
+	// Booking Service & Handler
+	bookingService, err := booking.NewService(pool)
+	if err != nil {
+		logger.Error("Failed to initialize booking service", "error", err)
+		os.Exit(1)
+	}
+
+	bookingHandler := booking.NewHandler(bookingService, logger)
 	mux := http.NewServeMux()
 
 	authHandler.RegisterRoutes(mux)
 	organizerHandler.RegisterRoutes(mux, authHandler)
 	venueBookingHandler.RegisterRoutes(mux, authHandler)
 	eventHandler.RegisterRoutes(mux, authHandler)
+	bookingHandler.RegisterRoutes(mux, authHandler)
 
 	// Health check endpoint
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
