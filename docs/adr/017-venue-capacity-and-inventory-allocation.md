@@ -1,7 +1,7 @@
 # ADR-017: Venue Capacity and Inventory Allocation
 
 - **Status:** Accepted
-- **Date:** 2026-11-14
+- **Date:** 2026-11-22
 
 ## Context
 
@@ -15,7 +15,76 @@ The system must ensure that the total number of tickets allocated across all cat
 
 It must also protect existing reservations and confirmed bookings when organizers or platform operators change capacity.
 
+Additionally, the system needs an efficient and concurrency-safe way to determine ticket availability.
+
+Two approaches were considered:
+
+### Approach A: Calculate availability from reservations
+
+Availability could be calculated by aggregating reservations:
+
+```sql
+SELECT
+    capacity
+    - confirmed_quantity
+    - active_held_quantity AS available
+FROM ...
+```
+
+Active held quantity would include reservations whose status is `held` and whose expiration timestamp is still in the future.
+
+Advantages:
+
+- No separate inventory counters that can become inconsistent.
+- Expired reservations automatically stop contributing to availability.
+- Conceptually straightforward.
+
+Disadvantages:
+
+- Availability queries become more expensive as reservation history grows.
+- Concurrent allocation still requires transaction coordination and locking.
+- Repeatedly aggregating reservations becomes increasingly expensive at scale.
+
+### Approach B: Maintain inventory counters
+
+The system maintains an inventory row for each ticket category.
+
+The row tracks:
+
+- `reserved_quantity`: quantity currently allocated to held reservations.
+- `sold_quantity`: quantity allocated to confirmed bookings.
+
+Available inventory is:
+
+```text
+available_quantity =
+    category_capacity
+    - reserved_quantity
+    - sold_quantity
+```
+
+Advantages:
+
+- Fast availability queries.
+- Atomic inventory allocation.
+- Avoids repeatedly aggregating reservation history.
+- Scales better for high-demand events.
+
+Disadvantages:
+
+- Counter consistency becomes critical.
+- Expiration must release inventory, not merely change a timestamp or reservation status.
+- Every lifecycle transition must update inventory transactionally.
+
 ## Decision
+
+TicketForge will use **inventory counters**, combined with lazy expiration and background cleanup.
+
+The database remains the source of truth.
+
+Reservation records represent the individual reservation lifecycle, while inventory counters maintain the aggregate allocation state for each ticket category.
+
+All changes to reservation states and their corresponding inventory counters must happen within the same database transaction.
 
 ### Venue capacity is the upper bound
 
@@ -47,6 +116,129 @@ An event may have no ticket categories configured yet. Such an event has no book
 
 Private events do not need ticket categories. However, an event must have at least one valid ticket category before it can be published.
 
+### Inventory counters
+
+Each ticket category has exactly one corresponding inventory row.
+
+The inventory row maintains:
+
+- `reserved_quantity`: quantity held by currently allocated reservations.
+- `sold_quantity`: quantity committed to confirmed bookings.
+
+The following invariant must always hold:
+
+`reserved_quantity >= 0`
+
+`sold_quantity >= 0`
+
+`reserved_quantity + sold_quantity <= ticket_category.capacity`
+
+Available inventory is calculated as:
+
+`available_quantity = capacity - reserved_quantity - sold_quantity`
+
+The database must protect these invariants through transactional updates, conditional updates, and appropriate constraints.
+
+Application-level availability checks alone are insufficient.
+
+### Inventory allocation during reservation creation
+
+When a customer requests tickets:
+
+1. Begin a database transaction.
+2. Lock the relevant event row.
+3. Validate that the event is active and its booking status is open.
+4. Lock and validate the requested ticket category.
+5. Reclaim expired reservations belonging to that category.
+6. Release their reserved inventory.
+7. Lock the inventory row.
+8. Calculate available inventory using the counters.
+9. Reject the request if insufficient inventory remains.
+10. Create the new held reservation.
+11. Increment `reserved_quantity` by the requested quantity.
+12. Commit the transaction.
+
+The expiration cleanup and new inventory allocation must occur in the same transaction.
+
+This ensures that another request cannot consume inventory between releasing expired holds and allocating the new reservation.
+
+### Reservation confirmation
+
+When an eligible reservation is successfully paid:
+
+- The reservation transitions from `held` to `confirmed`.
+- A booking is created.
+- `reserved_quantity` decreases by the reservation quantity.
+- `sold_quantity` increases by the same quantity.
+
+These changes must occur atomically.
+
+The total allocated inventory must remain unchanged during confirmation.
+
+### Reservation expiration
+
+When a reservation expires:
+
+- Its status transitions from `held` to `expired`.
+- Its reserved inventory is released.
+- `reserved_quantity` decreases by the reservation quantity.
+
+Expiration must release inventory exactly once.
+
+Repeated or concurrent expiration attempts must not decrement inventory more than once.
+
+See ADR-008 for the complete reservation expiration policy.
+
+### Lazy expiration and background cleanup
+
+TicketForge uses two complementary expiration mechanisms.
+
+**Lazy expiration**
+
+When a new reservation request needs inventory for a ticket category, the transaction first reclaims expired held reservations belonging to that category.
+
+This ensures that expired reservations do not permanently consume inventory simply because a background worker has not processed them yet.
+
+Lazy expiration is scoped to the requested category. A reservation request must not perform a global scan of every expired reservation in the system.
+
+**Background cleanup**
+
+A background worker periodically processes expired held reservations across all categories.
+
+Its purpose is to release inventory proactively, even when no new reservation requests arrive.
+
+The worker must:
+
+- Identify overdue held reservations.
+- Coordinate with other lifecycle operations through database transactions and row locks.
+- Transition reservations to expired.
+- Release their reserved inventory.
+- Avoid duplicate processing and double decrements.
+
+The worker must not be required for the correctness of new reservation allocation.
+
+See ADR-008 for expiration processing and worker coordination.
+
+### Inventory locking and concurrency
+
+Concurrent requests for the same ticket category must not allocate more inventory than the category's capacity.
+
+Inventory allocation must use database row locking and transactional updates.
+
+For example, if only two tickets remain and ten customers request two tickets simultaneously:
+
+- The first transaction locks the relevant inventory row.
+- It allocates the two remaining tickets and commits.
+- Subsequent transactions observe zero available inventory and are rejected.
+
+All reservation lifecycle operations must follow a consistent locking strategy.
+
+The event row is acquired first. Relevant reservation or category rows are then locked, followed by inventory rows.
+
+When multiple inventory rows must be locked, they should be acquired in a deterministic order.
+
+The database remains the source of truth. Application-level pre-checks may improve error messages but cannot replace transactional enforcement.
+
 ### Venue capacity increases
 
 The platform may increase a venue's capacity.
@@ -70,7 +262,7 @@ An organizer may reduce a ticket category's capacity only if the new capacity is
 Committed inventory includes:
 
 - Confirmed bookings.
-- Valid, unexpired Held reservations.
+- Valid, unexpired held reservations.
 
 Expired or otherwise released reservations do not count as committed inventory.
 
@@ -93,8 +285,6 @@ The implementation must coordinate:
 
 Use a consistent row-locking strategy to prevent concurrent transactions from independently passing checks and exceeding capacity.
 
-The database remains the source of truth. Application-level pre-checks may improve error messages but cannot replace transactional enforcement.
-
 Event creation and ticket category modifications must validate the capacity of the venue associated with the event's venue booking.
 
 Venue booking creation must preserve the venue's scheduling and booking constraints, but does not allocate ticket inventory by itself.
@@ -115,23 +305,37 @@ A venue booking can only be cancelled when it has no associated active event.
 
 - The physical venue capacity is respected across all ticket categories of an event.
 - Capacity reductions cannot silently invalidate an active event's allocation.
-- Existing Held reservations and confirmed bookings are protected during capacity changes.
-- The model supports multiple general-admission categories without introducing a separate global inventory limit.
+- Existing held reservations and confirmed bookings are protected during capacity changes.
+- Availability queries do not require repeatedly aggregating reservation history.
+- Inventory allocation is efficient and transactionally controlled.
+- Lazy expiration allows expired inventory to be reclaimed even if the background worker is unavailable.
+- Background cleanup proactively releases inventory when no new reservation requests arrive.
+- The model supports multiple general-admission categories without introducing a separate global ticket inventory limit.
 - Venue bookings and events retain separate responsibilities.
 - A venue booking can be reused for another event after its previously associated active event is cancelled.
 
 ### Negative
 
 - Capacity updates require transactions and coordinated locking.
+- Inventory counters must remain consistent with reservation and booking states.
+- Every lifecycle transition must update inventory transactionally.
+- Expiration requires both lazy cleanup and a background worker.
 - Venue capacity reductions may be rejected even when the number of tickets sold is low, because the allocated inventory itself exceeds the proposed venue capacity.
-- Capacity changes must coordinate with reservation creation, expiration, and payment confirmation.
 - Capacity validation must account for the relationship between venue bookings and their associated events.
 
 ## Alternatives considered
 
-### Enforce capacity only against tickets sold
+### Calculate availability from reservation records
 
-Rejected because an event could have allocated inventory exceeding the physical venue capacity even before those tickets are sold.
+Rejected because repeatedly aggregating reservation history makes availability queries increasingly expensive as reservation volume grows.
+
+### Use inventory counters without expiration cleanup
+
+Rejected because expired reservations would continue consuming inventory until some other process released it.
+
+### Depend exclusively on a background expiration worker
+
+Rejected because worker downtime or processing delays could temporarily prevent customers from reserving inventory that should already be available.
 
 ### Use an ordinary `CHECK` constraint across ticket category rows
 
