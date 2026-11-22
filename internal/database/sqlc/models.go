@@ -103,6 +103,18 @@ type PaymentAttempt struct {
 	ProviderOrderReference pgtype.Text        `db:"provider_order_reference" json:"provider_order_reference"`
 }
 
+type PaymentWebhookEvent struct {
+	ID               pgtype.UUID        `db:"id" json:"id"`
+	Provider         string             `db:"provider" json:"provider"`
+	ProviderEventID  string             `db:"provider_event_id" json:"provider_event_id"`
+	PaymentAttemptID pgtype.UUID        `db:"payment_attempt_id" json:"payment_attempt_id"`
+	EventType        string             `db:"event_type" json:"event_type"`
+	Payload          []byte             `db:"payload" json:"payload"`
+	ReceivedAt       pgtype.Timestamptz `db:"received_at" json:"received_at"`
+	ProcessedAt      pgtype.Timestamptz `db:"processed_at" json:"processed_at"`
+	ProcessingStatus string             `db:"processing_status" json:"processing_status"`
+}
+
 type RateLimitBucket struct {
 	Key          string             `db:"key" json:"key"`
 	Tokens       int64              `db:"tokens" json:"tokens"`

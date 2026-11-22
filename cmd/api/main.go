@@ -15,11 +15,17 @@ import (
 	"github.com/Punith1117/ticket-forge/internal/booking"
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
+	"github.com/Punith1117/ticket-forge/internal/database/sqlc"
 	"github.com/Punith1117/ticket-forge/internal/event"
 	"github.com/Punith1117/ticket-forge/internal/organizer"
+	"github.com/Punith1117/ticket-forge/internal/payment"
+	"github.com/Punith1117/ticket-forge/internal/payment/simulator"
 	"github.com/Punith1117/ticket-forge/internal/ratelimit"
 	"github.com/Punith1117/ticket-forge/internal/security"
 	"github.com/Punith1117/ticket-forge/internal/venuebooking"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -162,6 +168,34 @@ func main() {
 	}
 
 	bookingHandler := booking.NewHandler(bookingService, logger)
+
+	// Payment Service & Handler
+	payCfg, err := payment.ConfigFromEnv()
+	if err != nil {
+		logger.Error("Failed to load payment configuration", "error", err)
+		os.Exit(1)
+	}
+
+	simProvider, err := simulator.NewProvider(payCfg.WebhookSecret, payCfg.WebhookURL, nil)
+	if err != nil {
+		logger.Error("Failed to initialize simulated payment provider", "error", err)
+		os.Exit(1)
+	}
+
+	paymentRepo, err := payment.NewRepository(pool)
+	if err != nil {
+		logger.Error("Failed to initialize payment repository", "error", err)
+		os.Exit(1)
+	}
+
+	paymentService, err := payment.NewService(pool, paymentRepo, simProvider)
+	if err != nil {
+		logger.Error("Failed to initialize payment service", "error", err)
+		os.Exit(1)
+	}
+
+	paymentHandler := payment.NewHandler(paymentService, logger)
+
 	mux := http.NewServeMux()
 
 	authHandler.RegisterRoutes(mux)
@@ -169,6 +203,15 @@ func main() {
 	venueBookingHandler.RegisterRoutes(mux, authHandler)
 	eventHandler.RegisterRoutes(mux, authHandler)
 	bookingHandler.RegisterRoutes(mux, authHandler)
+	paymentHandler.RegisterRoutes(mux, authHandler)
+
+	// Simulated hosted checkout routes (strictly disabled in production)
+	isDevMode := os.Getenv("ENV") != "production"
+	if isDevMode && payCfg.Provider == "simulated" {
+		simProvider.SetReservationChecker(&reservationCheckerAdapter{pool: pool})
+		simProvider.RegisterRoutes(mux)
+		logger.Info("Simulated payment hosted checkout enabled", "provider", payCfg.Provider)
+	}
 
 	// Health check endpoint
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -214,4 +257,23 @@ func main() {
 	}
 
 	logger.Info("TicketForge API server stopped successfully")
+}
+
+type reservationCheckerAdapter struct {
+	pool *pgxpool.Pool
+}
+
+func (a *reservationCheckerAdapter) GetReservationStatus(ctx context.Context, reservationID string) (simulator.ReservationStatus, error) {
+	u, err := uuid.Parse(reservationID)
+	if err != nil {
+		return simulator.ReservationStatus{}, err
+	}
+	res, err := sqlc.New(a.pool).GetReservationByID(ctx, pgtype.UUID{Bytes: u, Valid: true})
+	if err != nil {
+		return simulator.ReservationStatus{}, err
+	}
+	return simulator.ReservationStatus{
+		Status:    res.Status,
+		ExpiresAt: res.ExpiresAt.Time,
+	}, nil
 }

@@ -38,6 +38,7 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 
 	// Clean transient test data
 	_, err = pool.Exec(ctx, `
+		DELETE FROM payment_webhook_events;
 		DELETE FROM refunds;
 		DELETE FROM bookings;
 		DELETE FROM payment_attempts;
@@ -926,5 +927,95 @@ func TestOutboxPayloadScrubbingAndDomainEvents(t *testing.T) {
 	`)
 	if err != nil {
 		t.Fatalf("expected non-email domain event to succeed: %v", err)
+	}
+}
+
+func TestPaymentWebhookEventsSchemaConstraints(t *testing.T) {
+	pool := setupTestDB(t)
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	// 1. Valid insertion in processing status
+	var eventID string
+	err := pool.QueryRow(ctx, `
+		INSERT INTO payment_webhook_events (
+			provider,
+			provider_event_id,
+			event_type,
+			payload,
+			processing_status
+		)
+		VALUES ('simulated', 'evt_schema_1', 'payment.succeeded', '{"test":true}', 'processing')
+		RETURNING id::text
+	`).Scan(&eventID)
+	if err != nil {
+		t.Fatalf("failed to insert valid webhook event: %v", err)
+	}
+
+	// 2. Duplicate (provider, provider_event_id) violates uniqueness
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_webhook_events (
+			provider,
+			provider_event_id,
+			event_type,
+			payload,
+			processing_status
+		)
+		VALUES ('simulated', 'evt_schema_1', 'payment.succeeded', '{"test":true}', 'processing')
+	`)
+	if err == nil {
+		t.Fatal("expected unique constraint violation for duplicate provider event ID, but succeeded")
+	}
+	pgErr, ok := err.(*pgconn.PgError)
+	if !ok || pgErr.Code != "23505" { // unique_violation
+		t.Fatalf("expected 23505 unique_violation, got %v", err)
+	}
+
+	// 3. Invalid processing status violates check constraint
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_webhook_events (
+			provider,
+			provider_event_id,
+			event_type,
+			payload,
+			processing_status
+		)
+		VALUES ('simulated', 'evt_schema_2', 'payment.succeeded', '{"test":true}', 'invalid_status')
+	`)
+	if err == nil {
+		t.Fatal("expected check constraint violation for invalid status, but succeeded")
+	}
+
+	// 4. Status 'processed' requires processed_at NOT NULL
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_webhook_events (
+			provider,
+			provider_event_id,
+			event_type,
+			payload,
+			processing_status,
+			processed_at
+		)
+		VALUES ('simulated', 'evt_schema_3', 'payment.succeeded', '{"test":true}', 'processed', NULL)
+	`)
+	if err == nil {
+		t.Fatal("expected check constraint violation for processed with null processed_at, but succeeded")
+	}
+
+	// 5. Status <> 'processed' requires processed_at IS NULL
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_webhook_events (
+			provider,
+			provider_event_id,
+			event_type,
+			payload,
+			processing_status,
+			processed_at
+		)
+		VALUES ('simulated', 'evt_schema_4', 'payment.succeeded', '{"test":true}', 'processing', now())
+	`)
+	if err == nil {
+		t.Fatal("expected check constraint violation for non-processed with non-null processed_at, but succeeded")
 	}
 }

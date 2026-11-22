@@ -49,6 +49,13 @@ func setupIntegrationDB(t *testing.T) (*pgxpool.Pool, *auth.Service, *security.T
 		DELETE FROM registration_verification_challenges;
 		DELETE FROM outbox_events;
 
+		DELETE FROM payment_webhook_events;
+		DELETE FROM refunds;
+		DELETE FROM bookings;
+		DELETE FROM payment_attempts;
+		DELETE FROM reservations;
+		DELETE FROM inventory;
+		DELETE FROM ticket_categories;
 		DELETE FROM events;
 		DELETE FROM venue_bookings;
 		DELETE FROM organizer_profiles;

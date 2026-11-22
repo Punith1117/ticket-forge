@@ -23,6 +23,14 @@ type Querier interface {
 	CreateInventory(ctx context.Context, ticketCategoryID pgtype.UUID) error
 	CreateOrganizerProfile(ctx context.Context, id pgtype.UUID) (OrganizerProfile, error)
 	CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error)
+	// ============================================================
+	// PAYMENT ATTEMPTS
+	// ============================================================
+	CreatePaymentAttempt(ctx context.Context, arg CreatePaymentAttemptParams) (PaymentAttempt, error)
+	// ============================================================
+	// WEBHOOK EVENTS
+	// ============================================================
+	CreatePaymentWebhookEvent(ctx context.Context, arg CreatePaymentWebhookEventParams) (PaymentWebhookEvent, error)
 	CreateRegistrationChallenge(ctx context.Context, arg CreateRegistrationChallengeParams) (RegistrationVerificationChallenge, error)
 	// Price is snapshotted from the category inside the database.
 	// The expiry is calculated using the database clock.
@@ -42,6 +50,7 @@ type Querier interface {
 	// Only expires a reservation that is still held and past its deadline.
 	ExpireReservation(ctx context.Context, id pgtype.UUID) (int64, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) (int64, error)
+	FailPaymentAttempt(ctx context.Context, arg FailPaymentAttemptParams) (PaymentAttempt, error)
 	GetActiveEventByVenueBookingID(ctx context.Context, venueBookingID pgtype.UUID) (Event, error)
 	GetActiveVenueForBooking(ctx context.Context, id pgtype.UUID) (GetActiveVenueForBookingRow, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
@@ -57,6 +66,9 @@ type Querier interface {
 	GetLatestRegistrationChallengeByEmail(ctx context.Context, email string) (RegistrationVerificationChallenge, error)
 	GetOrganizerProfileByUserID(ctx context.Context, userID pgtype.UUID) (OrganizerProfile, error)
 	GetPasswordResetTokenForUpdate(ctx context.Context, tokenHash string) (PasswordResetToken, error)
+	GetPaymentAttemptByID(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error)
+	GetPaymentAttemptByProviderOrder(ctx context.Context, arg GetPaymentAttemptByProviderOrderParams) (PaymentAttempt, error)
+	GetPaymentWebhookEvent(ctx context.Context, arg GetPaymentWebhookEventParams) (PaymentWebhookEvent, error)
 	GetRateLimitBucket(ctx context.Context, key string) (RateLimitBucket, error)
 	GetRateLimitBucketForUpdate(ctx context.Context, key string) (GetRateLimitBucketForUpdateRow, error)
 	GetRegistrationChallengeForUpdate(ctx context.Context, tokenHash string) (RegistrationVerificationChallenge, error)
@@ -104,11 +116,16 @@ type Querier interface {
 	// Capacity is already retrieved from the locked ticket category.
 	LockInventory(ctx context.Context, ticketCategoryID pgtype.UUID) (LockInventoryRow, error)
 	LockOrganizerProfile(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
+	LockPaymentAttemptByProviderOrder(ctx context.Context, arg LockPaymentAttemptByProviderOrderParams) (PaymentAttempt, error)
+	LockPaymentWebhookEvent(ctx context.Context, arg LockPaymentWebhookEventParams) (PaymentWebhookEvent, error)
 	LockVenueBookingForOrganizer(ctx context.Context, arg LockVenueBookingForOrganizerParams) (LockVenueBookingForOrganizerRow, error)
 	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)
 	RevokeAllSessionsByUserID(ctx context.Context, userID pgtype.UUID) (int64, error)
 	RevokeSessionByID(ctx context.Context, id pgtype.UUID) (int64, error)
+	SucceedPaymentAttempt(ctx context.Context, arg SucceedPaymentAttemptParams) (PaymentAttempt, error)
 	UpdateActiveEventBookingStatus(ctx context.Context, arg UpdateActiveEventBookingStatusParams) (Event, error)
+	UpdatePaymentAttemptProviderOrder(ctx context.Context, arg UpdatePaymentAttemptProviderOrderParams) (PaymentAttempt, error)
+	UpdatePaymentWebhookEventStatus(ctx context.Context, arg UpdatePaymentWebhookEventStatusParams) (PaymentWebhookEvent, error)
 	UpdateRateLimitBucket(ctx context.Context, arg UpdateRateLimitBucketParams) (int64, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error)
 	ValidateAndRefreshSession(ctx context.Context, arg ValidateAndRefreshSessionParams) (Session, error)
