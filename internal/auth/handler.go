@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 	"github.com/Punith1117/ticket-forge/internal/ratelimit"
 	"github.com/Punith1117/ticket-forge/internal/security"
 )
@@ -75,33 +76,54 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/auth/password-reset/complete", h.HandlePasswordResetComplete)
 }
 
-// ErrorResponse defines the standard JSON error schema.
-type ErrorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
+func (h *Handler) writeJSON(
+	w http.ResponseWriter,
+	status int,
+	data any,
+) {
+	if err := httpresponse.WriteJSON(w, status, data); err != nil {
+		h.logger.Error("failed to write JSON response",
+			"error", err,
+		)
+	}
 }
 
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
-}
-
-func (h *Handler) writeError(w http.ResponseWriter, status int, errCode, message string) {
-	h.writeJSON(w, status, ErrorResponse{
-		Error:   errCode,
-		Message: message,
-	})
+func (h *Handler) writeError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	if err := httpresponse.WriteError(
+		w,
+		status,
+		code,
+		message,
+	); err != nil {
+		h.logger.Error("failed to write HTTP error response",
+			"error", err,
+		)
+	}
 }
 
 // writeRateLimitError returns HTTP 429 Too Many Requests with a Retry-After header.
-func (h *Handler) writeRateLimitError(w http.ResponseWriter, retryAfter time.Duration) {
+func (h *Handler) writeRateLimitError(
+	w http.ResponseWriter,
+	retryAfter time.Duration,
+) {
 	retrySeconds := int(math.Ceil(retryAfter.Seconds()))
 	if retrySeconds < 1 {
 		retrySeconds = 1
 	}
+
 	w.Header().Set("Retry-After", strconv.Itoa(retrySeconds))
-	h.writeError(w, http.StatusTooManyRequests, "too_many_requests", "rate limit exceeded")
+
+	h.writeError(
+		w,
+		http.StatusTooManyRequests,
+		"TOO_MANY_REQUESTS",
+		"Rate limit exceeded.",
+	)
 }
 
 func (h *Handler) clientIP(r *http.Request) string {
@@ -136,13 +158,13 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	var req RegisterRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or malformed JSON payload.")
 		return
 	}
 
 	normEmail, err := NormalizeEmail(req.Email)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		h.writeError(w, http.StatusBadRequest, "INVALID_EMAIL", "Invalid email address format.")
 		return
 	}
 
@@ -153,7 +175,7 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		ipKey, err := h.keyDeriver.DeriveKey(PolicyRegisterIP.ID, ratelimit.DomainIP, clientIP)
 		if err != nil {
 			h.logger.Error("failed to derive register IP key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
@@ -161,7 +183,7 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// Fail closed on database / infrastructure errors
 			h.logger.Error("register IP rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !ipRes.Allowed {
@@ -173,7 +195,7 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		emailKey, err := h.keyDeriver.DeriveKey(PolicyRegisterEmail.ID, ratelimit.DomainEmail, normEmail)
 		if err != nil {
 			h.logger.Error("failed to derive register email key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
@@ -181,7 +203,7 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// Fail closed on database / infrastructure errors
 			h.logger.Error("register email rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !emailRes.Allowed {
@@ -194,15 +216,35 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	err = h.service.RequestRegistration(r.Context(), normEmail)
 	if err != nil {
 		if errors.Is(err, ErrInvalidEmail) {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"INVALID_EMAIL",
+				"Invalid email address format.",
+			)
 			return
 		}
+
 		if errors.Is(err, ErrCooldownActive) {
-			h.writeError(w, http.StatusTooManyRequests, "too_many_requests", err.Error())
+			h.writeError(
+				w,
+				http.StatusTooManyRequests,
+				"REGISTRATION_COOLDOWN_ACTIVE",
+				"Please wait before requesting another verification email.",
+			)
 			return
 		}
-		h.logger.Error("failed to process registration request", "error", err)
-		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+
+		h.logger.Error("failed to process registration request",
+			"error", err,
+		)
+
+		h.writeError(
+			w,
+			http.StatusInternalServerError,
+			"INTERNAL_SERVER_ERROR",
+			"An unexpected error occurred.",
+		)
 		return
 	}
 
@@ -215,13 +257,13 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request) {
 	var req RegisterCompleteRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or malformed JSON payload.")
 		return
 	}
 
 	rawToken := strings.TrimSpace(req.Token)
 	if rawToken == "" {
-		h.writeError(w, http.StatusBadRequest, "invalid_token", ErrInvalidToken.Error())
+		h.writeError(w, http.StatusBadRequest, "INVALID_TOKEN", "Invalid verification token.")
 		return
 	}
 
@@ -232,7 +274,7 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 		ipKey, err := h.keyDeriver.DeriveKey(PolicyRegisterCompleteIP.ID, ratelimit.DomainIP, clientIP)
 		if err != nil {
 			h.logger.Error("failed to derive register complete IP key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
@@ -240,7 +282,7 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			// Fail closed on database / infrastructure errors
 			h.logger.Error("register complete IP rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !ipRes.Allowed {
@@ -253,7 +295,7 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 		tokenKey, err := h.keyDeriver.DeriveKey(PolicyRegisterCompleteToken.ID, ratelimit.DomainToken, tokenHash)
 		if err != nil {
 			h.logger.Error("failed to derive register complete token key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
@@ -261,7 +303,7 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			// Fail closed on database / infrastructure errors
 			h.logger.Error("register complete token rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !tokenRes.Allowed {
@@ -275,19 +317,58 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidToken):
-			h.writeError(w, http.StatusBadRequest, "invalid_token", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"INVALID_TOKEN",
+				"Invalid verification token.",
+			)
+
 		case errors.Is(err, ErrTokenExpired):
-			h.writeError(w, http.StatusBadRequest, "token_expired", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"TOKEN_EXPIRED",
+				"Verification token has expired.",
+			)
+
 		case errors.Is(err, ErrTokenAlreadyConsumed):
-			h.writeError(w, http.StatusBadRequest, "token_already_used", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"TOKEN_ALREADY_USED",
+				"Verification token has already been used.",
+			)
+
 		case errors.Is(err, ErrInvalidPassword):
-			h.writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"INVALID_PASSWORD",
+				"Password must be between 12 and 128 characters.",
+			)
+
 		case errors.Is(err, ErrEmailAlreadyRegistered):
-			h.writeError(w, http.StatusConflict, "conflict", err.Error())
+			h.writeError(
+				w,
+				http.StatusConflict,
+				"EMAIL_ALREADY_REGISTERED",
+				"An account with this email address already exists.",
+			)
+
 		default:
-			h.logger.Error("failed to complete registration", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.logger.Error("failed to complete registration",
+				"error", err,
+			)
+
+			h.writeError(
+				w,
+				http.StatusInternalServerError,
+				"INTERNAL_SERVER_ERROR",
+				"An unexpected error occurred.",
+			)
 		}
+
 		return
 	}
 
@@ -301,16 +382,16 @@ func (h *Handler) HandleRegisterComplete(w http.ResponseWriter, r *http.Request)
 func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or malformed JSON payload.")
 		return
 	}
 
 	if req.Email == "" {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "email is required")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Email is required.")
 		return
 	}
 	if req.Password == "" {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "password is required")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Password is required.")
 		return
 	}
 
@@ -320,7 +401,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		ipKey, err := h.keyDeriver.DeriveKey(PolicyLoginIP.ID, ratelimit.DomainIP, clientIP)
 		if err != nil {
 			h.logger.Error("failed to derive login IP key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
@@ -328,7 +409,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// Fail closed on database / infrastructure errors
 			h.logger.Error("login IP rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !ipRes.Allowed {
@@ -350,7 +431,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 				emailKey, kErr := h.keyDeriver.DeriveKey(PolicyLoginEmailFailure.ID, ratelimit.DomainEmail, normEmail)
 				if kErr != nil {
 					h.logger.Error("failed to derive login email failure key", "error", kErr)
-					h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+					h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 					return
 				}
 
@@ -358,7 +439,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 				if fErr != nil {
 					// Fail closed on database / infrastructure errors
 					h.logger.Error("login email failure rate limit evaluation failed", "error", fErr)
-					h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+					h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 					return
 				}
 				if !failRes.Allowed {
@@ -369,12 +450,17 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Failure token was consumed within capacity; return generic credentials error
-			h.writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid email or password")
+			h.writeError(
+				w,
+				http.StatusUnauthorized,
+				"INVALID_CREDENTIALS",
+				"Invalid email or password.",
+			)
 			return
 		}
 
 		h.logger.Error("login failed with internal error", "error", err)
-		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
@@ -399,13 +485,18 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := UserFromContext(r.Context())
 	if !ok {
-		h.writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+		h.writeError(
+			w,
+			http.StatusUnauthorized,
+			"UNAUTHORIZED",
+			"Authentication required.",
+		)
 		return
 	}
 
 	if err := h.service.Logout(r.Context(), authUser.SessionID); err != nil {
 		h.logger.Error("logout failed", slog.String("error", err.Error()))
-		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
@@ -429,13 +520,13 @@ func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Request) {
 	var req PasswordResetRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or malformed JSON payload.")
 		return
 	}
 
 	normEmail, err := NormalizeEmail(req.Email)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		h.writeError(w, http.StatusBadRequest, "INVALID_EMAIL", "Invalid email address format.")
 		return
 	}
 
@@ -446,14 +537,14 @@ func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 		ipKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetIP.ID, ratelimit.DomainIP, clientIP)
 		if err != nil {
 			h.logger.Error("failed to derive password reset IP key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
 		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyPasswordResetIP)
 		if err != nil {
 			h.logger.Error("password reset IP rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !ipRes.Allowed {
@@ -465,14 +556,14 @@ func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 		emailKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetEmail.ID, ratelimit.DomainEmail, normEmail)
 		if err != nil {
 			h.logger.Error("failed to derive password reset email key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
 		emailRes, err := h.limiter.Allow(r.Context(), emailKey, PolicyPasswordResetEmail)
 		if err != nil {
 			h.logger.Error("password reset email rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !emailRes.Allowed {
@@ -485,7 +576,7 @@ func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 	err = h.service.RequestPasswordReset(r.Context(), normEmail)
 	if err != nil {
 		if errors.Is(err, ErrInvalidEmail) {
-			h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			h.writeError(w, http.StatusBadRequest, "INVALID_EMAIL", "Invalid email address format.")
 			return
 		}
 		if errors.Is(err, ErrCooldownActive) {
@@ -496,7 +587,7 @@ func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		h.logger.Error("failed to process password reset request", "error", err)
-		h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
@@ -509,19 +600,19 @@ func (h *Handler) HandlePasswordResetRequest(w http.ResponseWriter, r *http.Requ
 func (h *Handler) HandlePasswordResetComplete(w http.ResponseWriter, r *http.Request) {
 	var req PasswordResetCompleteRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid or malformed JSON payload")
+		h.writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "Invalid or malformed JSON payload.")
 		return
 	}
 
 	rawToken := strings.TrimSpace(req.Token)
 	if rawToken == "" {
-		h.writeError(w, http.StatusBadRequest, "invalid_token", ErrInvalidToken.Error())
+		h.writeError(w, http.StatusBadRequest, "INVALID_TOKEN", "Invalid password reset token.")
 		return
 	}
 
 	// Password strength is validated before rate limiting or DB access to avoid burning tokens on malformed requests
 	if err := security.ValidatePasswordStrength(req.Password); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+		h.writeError(w, http.StatusBadRequest, "INVALID_PASSWORD", "Password must be between 12 and 128 characters.")
 		return
 	}
 
@@ -532,14 +623,14 @@ func (h *Handler) HandlePasswordResetComplete(w http.ResponseWriter, r *http.Req
 		ipKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetCompleteIP.ID, ratelimit.DomainIP, clientIP)
 		if err != nil {
 			h.logger.Error("failed to derive password reset complete IP key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
 		ipRes, err := h.limiter.Allow(r.Context(), ipKey, PolicyPasswordResetCompleteIP)
 		if err != nil {
 			h.logger.Error("password reset complete IP rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !ipRes.Allowed {
@@ -552,14 +643,14 @@ func (h *Handler) HandlePasswordResetComplete(w http.ResponseWriter, r *http.Req
 		tokenKey, err := h.keyDeriver.DeriveKey(PolicyPasswordResetCompleteToken.ID, ratelimit.DomainToken, tokenHash)
 		if err != nil {
 			h.logger.Error("failed to derive password reset complete token key", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 
 		tokenRes, err := h.limiter.Allow(r.Context(), tokenKey, PolicyPasswordResetCompleteToken)
 		if err != nil {
 			h.logger.Error("password reset complete token rate limit evaluation failed", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 		if !tokenRes.Allowed {
@@ -573,17 +664,50 @@ func (h *Handler) HandlePasswordResetComplete(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidToken):
-			h.writeError(w, http.StatusBadRequest, "invalid_token", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"INVALID_TOKEN",
+				"Invalid password reset token.",
+			)
+
 		case errors.Is(err, ErrTokenExpired):
-			h.writeError(w, http.StatusBadRequest, "token_expired", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"TOKEN_EXPIRED",
+				"Password reset token has expired.",
+			)
+
 		case errors.Is(err, ErrTokenAlreadyConsumed):
-			h.writeError(w, http.StatusBadRequest, "token_already_used", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"TOKEN_ALREADY_USED",
+				"Password reset token has already been used.",
+			)
+
 		case errors.Is(err, ErrInvalidPassword):
-			h.writeError(w, http.StatusBadRequest, "invalid_password", err.Error())
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"INVALID_PASSWORD",
+				"Password must be between 12 and 128 characters.",
+			)
+
 		default:
-			h.logger.Error("failed to complete password reset", "error", err)
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.logger.Error("failed to complete password reset",
+				"error", err,
+			)
+
+			h.writeError(
+				w,
+				http.StatusInternalServerError,
+				"INTERNAL_SERVER_ERROR",
+				"An unexpected error occurred.",
+			)
 		}
+
 		return
 	}
 

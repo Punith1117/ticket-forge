@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 	"github.com/Punith1117/ticket-forge/internal/idempotency"
 	"github.com/Punith1117/ticket-forge/internal/organizer"
 )
@@ -69,7 +70,7 @@ func (h *Handler) getOrganizerProfileID(
 	)
 	if err != nil {
 		if errors.Is(err, organizer.ErrProfileNotFound) {
-			http.Error(w, "organizer profile not found", http.StatusNotFound)
+			h.writeError(w, http.StatusNotFound, "ORGANIZER_PROFILE_NOT_FOUND", "Organizer profile not found.")
 			return "", false
 		}
 
@@ -77,7 +78,7 @@ func (h *Handler) getOrganizerProfileID(
 			"user_id", userID,
 			"error", err,
 		)
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return "", false
 	}
 
@@ -87,7 +88,7 @@ func (h *Handler) getOrganizerProfileID(
 func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 	organizerProfileID, ok := h.getOrganizerProfileID(
@@ -101,13 +102,13 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 	var req CreateVenueBookingRequest
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		h.writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid request body.")
 		return
 	}
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
-		http.Error(w, "Idempotency-Key header is required", http.StatusBadRequest)
+		h.writeError(w, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required.")
 		return
 	}
 
@@ -129,17 +130,21 @@ func (h *Handler) CreateBooking(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusCreated, response)
+	if err := httpresponse.WriteJSON(w, http.StatusCreated, response); err != nil {
+		h.logger.Error("failed to write create venue booking response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) GetBooking(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 	organizerProfileID, ok := h.getOrganizerProfileID(
@@ -168,17 +173,21 @@ func (h *Handler) GetBooking(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusOK, response)
+	if err := httpresponse.WriteJSON(w, http.StatusOK, response); err != nil {
+		h.logger.Error("failed to write get venue booking response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) ListBookings(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 	organizerProfileID, ok := h.getOrganizerProfileID(
@@ -199,17 +208,21 @@ func (h *Handler) ListBookings(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusOK, response)
+	if err := httpresponse.WriteJSON(w, http.StatusOK, response); err != nil {
+		h.logger.Error("failed to write list venue bookings response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) CancelBooking(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 	organizerProfileID, ok := h.getOrganizerProfileID(
@@ -238,50 +251,82 @@ func (h *Handler) CancelBooking(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusOK, response)
+	if err := httpresponse.WriteJSON(w, http.StatusOK, response); err != nil {
+		h.logger.Error("failed to write cancel venue booking response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
+	var (
+		status  int
+		code    string
+		message string
+	)
+
 	switch {
 	case errors.Is(err, ErrOrganizerNotFound):
-		http.Error(w, "organizer profile not found", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "ORGANIZER_PROFILE_NOT_FOUND"
+		message = "Organizer profile not found."
 
 	case errors.Is(err, ErrVenueNotFound):
-		http.Error(w, "venue not found", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "VENUE_NOT_FOUND"
+		message = "Venue not found."
 
 	case errors.Is(err, ErrVenueUnavailable):
-		http.Error(w, "venue is unavailable", http.StatusConflict)
+		status = http.StatusConflict
+		code = "VENUE_UNAVAILABLE"
+		message = "Venue is unavailable."
 
 	case errors.Is(err, ErrVenueBookingNotFound):
-		http.Error(w, "venue booking not found", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "VENUE_BOOKING_NOT_FOUND"
+		message = "Venue booking not found."
 
 	case errors.Is(err, ErrVenueBookingCancelled):
-		http.Error(w, "venue booking is already cancelled", http.StatusConflict)
+		status = http.StatusConflict
+		code = "VENUE_BOOKING_CANCELLED"
+		message = "Venue booking is already cancelled."
 
 	case errors.Is(err, ErrVenueBookingHasActiveEvent):
-		http.Error(w, "venue booking has an active event", http.StatusConflict)
+		status = http.StatusConflict
+		code = "VENUE_BOOKING_HAS_ACTIVE_EVENT"
+		message = "Venue booking has an active event."
 
 	case errors.Is(err, ErrVenueBookingLimitReached):
-		http.Error(w, "organizer booking limit reached", http.StatusConflict)
+		status = http.StatusConflict
+		code = "VENUE_BOOKING_LIMIT_REACHED"
+		message = "Organizer booking limit reached."
 
 	case errors.Is(err, ErrVenueBookingOverlap):
-		http.Error(w, "venue is already booked for the selected time", http.StatusConflict)
+		status = http.StatusConflict
+		code = "VENUE_BOOKING_OVERLAP"
+		message = "Venue is already booked for the selected time."
 
 	case errors.Is(err, ErrInvalidSchedule),
 		errors.Is(err, ErrInvalidDuration),
 		errors.Is(err, ErrStartTimeTooSoon),
 		errors.Is(err, ErrStartTimeTooFar):
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_VENUE_BOOKING_REQUEST"
+		message = err.Error()
 
 	case errors.Is(err, idempotency.ErrInvalidRequest):
-		http.Error(w, "invalid idempotency request", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_IDEMPOTENCY_REQUEST"
+		message = "Invalid idempotency request."
 
 	case errors.Is(err, idempotency.ErrKeyReused):
-		http.Error(w, "idempotency key was already used with a different request", http.StatusConflict)
+		status = http.StatusConflict
+		code = "IDEMPOTENCY_KEY_REUSED"
+		message = "Idempotency key was already used with a different request."
 
 	case errors.Is(err, idempotency.ErrIncompleteRecord):
 		return false
@@ -290,11 +335,25 @@ func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
 		return false
 	}
 
+	h.writeError(w, status, code, message)
+
 	return true
 }
 
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+func (h *Handler) writeError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	if err := httpresponse.WriteError(
+		w,
+		status,
+		code,
+		message,
+	); err != nil {
+		h.logger.Error("failed to write HTTP error response",
+			"error", err,
+		)
+	}
 }

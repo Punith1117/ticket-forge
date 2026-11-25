@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 	"github.com/Punith1117/ticket-forge/internal/idempotency"
 )
 
@@ -39,7 +40,7 @@ func (h *Handler) RegisterRoutes(
 func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 
@@ -47,13 +48,13 @@ func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateReservationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		h.writeError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid request body.")
 		return
 	}
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
-		http.Error(w, "Idempotency-Key header is required", http.StatusBadRequest)
+		h.writeError(w, http.StatusBadRequest, "IDEMPOTENCY_KEY_REQUIRED", "Idempotency-Key header is required.")
 		return
 	}
 
@@ -76,44 +77,64 @@ func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusCreated, response)
+	if err := httpresponse.WriteJSON(w, http.StatusCreated, response); err != nil {
+		h.logger.Error("failed to write create reservation response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
+	var (
+		status  int
+		code    string
+		message string
+	)
+
 	switch {
 	case errors.Is(err, ErrMissingTicketCategoryID):
-		http.Error(w, "ticket_category_id is required", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "MISSING_TICKET_CATEGORY_ID"
+		message = "ticket_category_id is required."
 
 	case errors.Is(err, ErrInvalidEventID),
 		errors.Is(err, ErrInvalidTicketCategoryID),
 		errors.Is(err, ErrInvalidQuantity):
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_RESERVATION_REQUEST"
+		message = err.Error()
 
 	case errors.Is(err, idempotency.ErrInvalidRequest):
-		http.Error(w, "invalid idempotency request", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_IDEMPOTENCY_REQUEST"
+		message = "Invalid idempotency request."
 
 	case errors.Is(err, idempotency.ErrKeyReused):
-		http.Error(
-			w,
-			"idempotency key was already used with a different request",
-			http.StatusConflict,
-		)
+		status = http.StatusConflict
+		code = "IDEMPOTENCY_KEY_REUSED"
+		message = "Idempotency key was already used with a different request."
 
 	case errors.Is(err, idempotency.ErrIncompleteRecord):
 		return false
 
 	case errors.Is(err, ErrEventNotBookable):
-		http.Error(w, "event is not currently accepting reservations", http.StatusConflict)
+		status = http.StatusConflict
+		code = "EVENT_NOT_BOOKABLE"
+		message = "Event is not currently accepting reservations."
 
 	case errors.Is(err, ErrTicketCategoryUnavailable):
-		http.Error(w, "ticket category is unavailable", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "TICKET_CATEGORY_UNAVAILABLE"
+		message = "Ticket category is unavailable."
 
 	case errors.Is(err, ErrInsufficientInventory):
-		http.Error(w, "not enough tickets available", http.StatusConflict)
+		status = http.StatusConflict
+		code = "INSUFFICIENT_INVENTORY"
+		message = "Not enough tickets available."
 
 	case errors.Is(err, ErrInventoryUnavailable):
 		// This indicates an unexpected database/inventory consistency issue.
@@ -123,11 +144,25 @@ func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
 		return false
 	}
 
+	h.writeError(w, status, code, message)
+
 	return true
 }
 
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+func (h *Handler) writeError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	if err := httpresponse.WriteError(
+		w,
+		status,
+		code,
+		message,
+	); err != nil {
+		h.logger.Error("failed to write HTTP error response",
+			"error", err,
+		)
+	}
 }

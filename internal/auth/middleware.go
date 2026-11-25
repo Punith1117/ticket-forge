@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -52,13 +53,13 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 		cookie, err := r.Cookie(SessionCookieName)
 		if err != nil {
 			// http.ErrNoCookie or parse error — no session present.
-			h.writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 			return
 		}
 
 		rawToken := cookie.Value
 		if rawToken == "" {
-			h.writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 			return
 		}
 
@@ -68,15 +69,15 @@ func (h *Handler) Middleware(next http.Handler) http.Handler {
 
 		session, err := h.service.ValidateSession(r.Context(), tokenHash)
 		if err != nil {
-			if err == ErrSessionNotFound {
+			if errors.Is(err, ErrSessionNotFound) {
 				// Unknown, revoked, or expired — generic 401, no detail leaked.
-				h.writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+				h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 				return
 			}
 			// Genuine database or internal error.
 			// Return 500 — do not silently log users out on infrastructure failures.
 			h.logger.Error("session validation failed", slog.String("error", err.Error()))
-			h.writeError(w, http.StatusInternalServerError, "internal_error", "an unexpected error occurred")
+			h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 			return
 		}
 

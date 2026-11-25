@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 	"github.com/Punith1117/ticket-forge/internal/payment"
 )
 
@@ -164,38 +165,38 @@ func (p *Provider) RegisterRoutes(mux *http.ServeMux) {
 func (p *Provider) HandleCheckoutPage(w http.ResponseWriter, r *http.Request) {
 	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
 	if sessionID == "" {
-		http.Error(w, "session_id query parameter is required", http.StatusBadRequest)
+		_ = httpresponse.WriteError(w, http.StatusBadRequest, "SESSION_ID_REQUIRED", "session_id query parameter is required.")
 		return
 	}
 
 	session, ok := p.sessions.Get(sessionID)
 	if !ok {
-		http.Error(w, "checkout session not found", http.StatusNotFound)
+		_ = httpresponse.WriteError(w, http.StatusNotFound, "CHECKOUT_SESSION_NOT_FOUND", "Checkout session not found.")
 		return
 	}
 
 	if session.Completed {
-		http.Error(w, "checkout session has already been completed", http.StatusConflict)
+		_ = httpresponse.WriteError(w, http.StatusConflict, "CHECKOUT_SESSION_ALREADY_COMPLETED", "Checkout session has already been completed.")
 		return
 	}
 
 	if !time.Now().UTC().Before(session.ExpiresAt) {
-		http.Error(w, "checkout session has expired", http.StatusConflict)
+		_ = httpresponse.WriteError(w, http.StatusConflict, "CHECKOUT_SESSION_EXPIRED", "Checkout session has expired.")
 		return
 	}
 
 	if p.reservationChecker != nil {
 		status, err := p.reservationChecker.GetReservationStatus(r.Context(), session.ReservationID)
 		if err != nil {
-			http.Error(w, "failed to verify reservation status", http.StatusNotFound)
+			_ = httpresponse.WriteError(w, http.StatusNotFound, "RESERVATION_STATUS_UNAVAILABLE", "Failed to verify reservation status.")
 			return
 		}
 		if status.Status != "held" {
-			http.Error(w, "reservation is no longer in held status", http.StatusConflict)
+			_ = httpresponse.WriteError(w, http.StatusConflict, "RESERVATION_NOT_HELD", "Reservation is no longer in held status.")
 			return
 		}
 		if !time.Now().UTC().Before(status.ExpiresAt) {
-			http.Error(w, "reservation hold has expired", http.StatusConflict)
+			_ = httpresponse.WriteError(w, http.StatusConflict, "RESERVATION_HOLD_EXPIRED", "Reservation hold has expired.")
 			return
 		}
 	}
@@ -221,24 +222,24 @@ type completeOutcomeRequest struct {
 func (p *Provider) HandleCompleteSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionID")
 	if sessionID == "" {
-		http.Error(w, "session ID is required", http.StatusBadRequest)
+		_ = httpresponse.WriteError(w, http.StatusBadRequest, "SESSION_ID_REQUIRED", "Session ID is required.")
 		return
 	}
 
 	session, ok := p.sessions.Get(sessionID)
 	if !ok {
-		http.Error(w, "checkout session not found", http.StatusNotFound)
+		_ = httpresponse.WriteError(w, http.StatusNotFound, "CHECKOUT_SESSION_NOT_FOUND", "Checkout session not found.")
 		return
 	}
 
 	if session.Completed {
-		http.Error(w, "checkout session has already been completed", http.StatusConflict)
+		_ = httpresponse.WriteError(w, http.StatusConflict, "CHECKOUT_SESSION_ALREADY_COMPLETED", "Checkout session has already been completed.")
 		return
 	}
 
 	// 1. Validate session expiration
 	if !time.Now().UTC().Before(session.ExpiresAt) {
-		http.Error(w, "checkout session has expired", http.StatusConflict)
+		_ = httpresponse.WriteError(w, http.StatusConflict, "CHECKOUT_SESSION_EXPIRED", "Checkout session has expired.")
 		return
 	}
 
@@ -246,15 +247,15 @@ func (p *Provider) HandleCompleteSession(w http.ResponseWriter, r *http.Request)
 	if p.reservationChecker != nil {
 		status, err := p.reservationChecker.GetReservationStatus(r.Context(), session.ReservationID)
 		if err != nil {
-			http.Error(w, "associated reservation not found", http.StatusNotFound)
+			_ = httpresponse.WriteError(w, http.StatusNotFound, "RESERVATION_NOT_FOUND", "Associated reservation not found.")
 			return
 		}
 		if status.Status != "held" {
-			http.Error(w, "associated reservation is not held", http.StatusConflict)
+			_ = httpresponse.WriteError(w, http.StatusConflict, "RESERVATION_NOT_HELD", "Associated reservation is not held.")
 			return
 		}
 		if !time.Now().UTC().Before(status.ExpiresAt) {
-			http.Error(w, "associated reservation has expired", http.StatusConflict)
+			_ = httpresponse.WriteError(w, http.StatusConflict, "RESERVATION_EXPIRED", "Associated reservation has expired.")
 			return
 		}
 	}
@@ -264,7 +265,7 @@ func (p *Provider) HandleCompleteSession(w http.ResponseWriter, r *http.Request)
 	contentType := r.Header.Get("Content-Type")
 	if strings.Contains(contentType, "application/json") {
 		if err := json.NewDecoder(r.Body).Decode(&outcomeReq); err != nil {
-			http.Error(w, "invalid request body", http.StatusBadRequest)
+			_ = httpresponse.WriteError(w, http.StatusBadRequest, "INVALID_JSON", "Invalid request body.")
 			return
 		}
 	} else {
@@ -275,7 +276,7 @@ func (p *Provider) HandleCompleteSession(w http.ResponseWriter, r *http.Request)
 
 	outcomeReq.Outcome = strings.TrimSpace(outcomeReq.Outcome)
 	if outcomeReq.Outcome != string(payment.PaymentOutcomeSucceeded) && outcomeReq.Outcome != string(payment.PaymentOutcomeFailed) {
-		http.Error(w, "invalid outcome: must be 'succeeded' or 'failed'", http.StatusBadRequest)
+		_ = httpresponse.WriteError(w, http.StatusBadRequest, "INVALID_OUTCOME", "Invalid outcome: must be 'succeeded' or 'failed'.")
 		return
 	}
 
@@ -285,10 +286,10 @@ func (p *Provider) HandleCompleteSession(w http.ResponseWriter, r *http.Request)
 	completedRecord, err := p.sessions.Complete(sessionID, outcome)
 	if err != nil {
 		if errors.Is(err, ErrSessionAlreadyCompleted) {
-			http.Error(w, "checkout session has already been completed", http.StatusConflict)
+			_ = httpresponse.WriteError(w, http.StatusConflict, "CHECKOUT_SESSION_ALREADY_COMPLETED", "Checkout session has already been completed.")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		_ = httpresponse.WriteError(w, http.StatusBadRequest, "CHECKOUT_SESSION_COMPLETION_FAILED", err.Error())
 		return
 	}
 
@@ -301,13 +302,11 @@ func (p *Provider) HandleCompleteSession(w http.ResponseWriter, r *http.Request)
 		outcome,
 		outcomeReq.FailureReason,
 	); err != nil {
-		http.Error(w, fmt.Sprintf("failed to deliver signed webhook: %v", err), http.StatusBadGateway)
+		_ = httpresponse.WriteError(w, http.StatusBadGateway, "WEBHOOK_DELIVERY_FAILED", fmt.Sprintf("Failed to deliver signed webhook: %v", err))
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	_ = httpresponse.WriteJSON(w, http.StatusOK, map[string]any{
 		"status":     "completed",
 		"outcome":    outcome,
 		"session_id": sessionID,

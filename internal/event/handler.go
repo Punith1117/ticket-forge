@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 	"github.com/Punith1117/ticket-forge/internal/idempotency"
 	"github.com/Punith1117/ticket-forge/internal/organizer"
 )
@@ -59,7 +60,12 @@ func (h *Handler) getOrganizerProfileID(
 	)
 	if err != nil {
 		if errors.Is(err, organizer.ErrProfileNotFound) {
-			http.Error(w, "organizer profile not found", http.StatusNotFound)
+			h.writeError(
+				w,
+				http.StatusNotFound,
+				"ORGANIZER_PROFILE_NOT_FOUND",
+				"Organizer profile not found.",
+			)
 			return "", false
 		}
 
@@ -68,10 +74,11 @@ func (h *Handler) getOrganizerProfileID(
 			"error", err,
 		)
 
-		http.Error(
+		h.writeError(
 			w,
-			"an unexpected error occurred",
 			http.StatusInternalServerError,
+			"INTERNAL_SERVER_ERROR",
+			"An unexpected error occurred.",
 		)
 		return "", false
 	}
@@ -82,7 +89,12 @@ func (h *Handler) getOrganizerProfileID(
 func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(
+			w,
+			http.StatusUnauthorized,
+			"UNAUTHORIZED",
+			"Authentication required.",
+		)
 		return
 	}
 
@@ -101,23 +113,34 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		h.writeError(
+			w,
+			http.StatusBadRequest,
+			"INVALID_JSON",
+			"Invalid request body.",
+		)
 		return
 	}
 
 	// Reject additional JSON values after the request object.
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		h.writeError(
+			w,
+			http.StatusBadRequest,
+			"INVALID_JSON",
+			"Invalid request body.",
+		)
 		return
 	}
 
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
-		http.Error(
+		h.writeError(
 			w,
-			"Idempotency-Key header is required",
 			http.StatusBadRequest,
+			"IDEMPOTENCY_KEY_REQUIRED",
+			"Idempotency-Key header is required.",
 		)
 		return
 	}
@@ -140,15 +163,24 @@ func (h *Handler) CreateEvent(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 		)
 
-		http.Error(
+		h.writeError(
 			w,
-			"an unexpected error occurred",
 			http.StatusInternalServerError,
+			"INTERNAL_SERVER_ERROR",
+			"An unexpected error occurred.",
 		)
 		return
 	}
 
-	h.writeJSON(w, http.StatusCreated, response)
+	if err := httpresponse.WriteJSON(
+		w,
+		http.StatusCreated,
+		response,
+	); err != nil {
+		h.logger.Error("failed to write create event response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) UpdateBookingStatus(
@@ -157,7 +189,12 @@ func (h *Handler) UpdateBookingStatus(
 ) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(
+			w,
+			http.StatusUnauthorized,
+			"UNAUTHORIZED",
+			"Authentication required.",
+		)
 		return
 	}
 
@@ -176,14 +213,24 @@ func (h *Handler) UpdateBookingStatus(
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		h.writeError(
+			w,
+			http.StatusBadRequest,
+			"INVALID_JSON",
+			"Invalid request body.",
+		)
 		return
 	}
 
 	// Reject additional JSON values after the request object.
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		h.writeError(
+			w,
+			http.StatusBadRequest,
+			"INVALID_JSON",
+			"Invalid request body.",
+		)
 		return
 	}
 
@@ -207,80 +254,111 @@ func (h *Handler) UpdateBookingStatus(
 			"error", err,
 		)
 
-		http.Error(
+		h.writeError(
 			w,
-			"an unexpected error occurred",
 			http.StatusInternalServerError,
+			"INTERNAL_SERVER_ERROR",
+			"An unexpected error occurred.",
 		)
 		return
 	}
 
-	h.writeJSON(w, http.StatusOK, response)
+	if err := httpresponse.WriteJSON(
+		w,
+		http.StatusOK,
+		response,
+	); err != nil {
+		h.logger.Error("failed to write booking status response",
+			"error", err,
+		)
+	}
 }
 
-func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
+func (h *Handler) handleServiceError(
+	w http.ResponseWriter,
+	err error,
+) bool {
+	var (
+		status  int
+		code    string
+		message string
+	)
+
 	switch {
 	case errors.Is(err, ErrInvalidRequest):
-		http.Error(w, "invalid event request", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_EVENT_REQUEST"
+		message = "Invalid event request."
 
-	case errors.Is(err, ErrVenueBookingNotFound):
-		http.Error(w, "venue booking not found", http.StatusNotFound)
-
-	case errors.Is(err, ErrVenueBookingNotOwned):
-		http.Error(w, "venue booking not found", http.StatusNotFound)
+	case errors.Is(err, ErrVenueBookingNotFound),
+		errors.Is(err, ErrVenueBookingNotOwned):
+		status = http.StatusNotFound
+		code = "VENUE_BOOKING_NOT_FOUND"
+		message = "Venue booking not found."
 
 	case errors.Is(err, ErrVenueBookingUnavailable):
-		http.Error(w, "venue booking is unavailable", http.StatusConflict)
+		status = http.StatusConflict
+		code = "VENUE_BOOKING_UNAVAILABLE"
+		message = "Venue booking is unavailable."
 
 	case errors.Is(err, ErrActiveEventAlreadyExists):
-		http.Error(
-			w,
-			"an active event already exists for this venue booking",
-			http.StatusConflict,
-		)
+		status = http.StatusConflict
+		code = "ACTIVE_EVENT_ALREADY_EXISTS"
+		message = "An active event already exists for this venue booking."
 
 	case errors.Is(err, ErrTicketCapacityExceeded):
-		http.Error(
-			w,
-			"total ticket category capacity exceeds venue capacity",
-			http.StatusBadRequest,
-		)
+		status = http.StatusBadRequest
+		code = "TICKET_CAPACITY_EXCEEDED"
+		message = "Total ticket category capacity exceeds venue capacity."
 
 	case errors.Is(err, ErrEventNotFound):
-		http.Error(w, "event not found", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "EVENT_NOT_FOUND"
+		message = "Event not found."
 
 	case errors.Is(err, ErrEventNotActive):
-		http.Error(w, "cancelled events cannot be reopened", http.StatusConflict)
+		status = http.StatusConflict
+		code = "EVENT_NOT_ACTIVE"
+		message = "Cancelled events cannot be reopened."
 
 	case errors.Is(err, ErrInvalidBookingStatus):
-		http.Error(
-			w,
-			"booking_status must be either 'open' or 'paused'",
-			http.StatusBadRequest,
-		)
+		status = http.StatusBadRequest
+		code = "INVALID_BOOKING_STATUS"
+		message = "Booking status must be either 'open' or 'paused'."
 
 	case errors.Is(err, idempotency.ErrInvalidRequest):
-		http.Error(w, "invalid idempotency request", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_IDEMPOTENCY_REQUEST"
+		message = "Invalid idempotency request."
 
 	case errors.Is(err, idempotency.ErrKeyReused):
-		http.Error(
-			w,
-			"idempotency key was already used with a different request",
-			http.StatusConflict,
-		)
-
-	case errors.Is(err, idempotency.ErrIncompleteRecord):
-		return false
+		status = http.StatusConflict
+		code = "IDEMPOTENCY_KEY_REUSED"
+		message = "Idempotency key was already used with a different request."
 
 	default:
 		return false
 	}
 
+	h.writeError(w, status, code, message)
+
 	return true
 }
 
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+func (h *Handler) writeError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	if err := httpresponse.WriteError(
+		w,
+		status,
+		code,
+		message,
+	); err != nil {
+		h.logger.Error("failed to write HTTP error response",
+			"error", err,
+		)
+	}
 }

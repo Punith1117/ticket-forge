@@ -1,13 +1,13 @@
 package payment
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 )
 
 type Handler struct {
@@ -44,13 +44,13 @@ func (h *Handler) RegisterRoutes(
 func (h *Handler) CreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 
 	reservationID := r.PathValue("reservationID")
 	if reservationID == "" {
-		http.Error(w, "reservation ID is required", http.StatusBadRequest)
+		h.writeError(w, http.StatusBadRequest, "RESERVATION_ID_REQUIRED", "Reservation ID is required.")
 		return
 	}
 
@@ -65,11 +65,15 @@ func (h *Handler) CreateCheckoutSession(w http.ResponseWriter, r *http.Request) 
 			"reservation_id", reservationID,
 			"error", err,
 		)
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusCreated, resp)
+	if err := httpresponse.WriteJSON(w, http.StatusCreated, resp); err != nil {
+		h.logger.Error("failed to write create checkout session response",
+			"error", err,
+		)
+	}
 }
 
 // HandlePaymentWebhook processes incoming payment provider webhooks.
@@ -77,7 +81,7 @@ func (h *Handler) HandlePaymentWebhook(w http.ResponseWriter, r *http.Request) {
 	// Max bounded request body: 64KB
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64*1024))
 	if err != nil {
-		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		h.writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_BODY_TOO_LARGE", "Request body too large.")
 		return
 	}
 
@@ -87,55 +91,111 @@ func (h *Handler) HandlePaymentWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 
 		h.logger.Error("failed to process payment webhook", "error", err)
-		http.Error(w, "internal server error", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "Internal server error.")
 		return
 	}
 
-	h.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	if err := httpresponse.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"}); err != nil {
+		h.logger.Error("failed to write payment webhook response",
+			"error", err,
+		)
+	}
 }
 
 func (h *Handler) handleCheckoutError(w http.ResponseWriter, err error) bool {
+	var (
+		status  int
+		code    string
+		message string
+	)
+
 	switch {
 	case errors.Is(err, ErrReservationNotFound):
-		http.Error(w, "reservation not found", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "RESERVATION_NOT_FOUND"
+		message = "Reservation not found."
 	case errors.Is(err, ErrReservationForbidden):
-		http.Error(w, "reservation does not belong to customer", http.StatusForbidden)
+		status = http.StatusForbidden
+		code = "RESERVATION_FORBIDDEN"
+		message = "Reservation does not belong to customer."
 	case errors.Is(err, ErrReservationNotHeld):
-		http.Error(w, "reservation is not in held status", http.StatusConflict)
+		status = http.StatusConflict
+		code = "RESERVATION_NOT_HELD"
+		message = "Reservation is not in held status."
 	case errors.Is(err, ErrReservationExpired):
-		http.Error(w, "reservation has expired", http.StatusConflict)
+		status = http.StatusConflict
+		code = "RESERVATION_EXPIRED"
+		message = "Reservation has expired."
 	case errors.Is(err, ErrFreeReservationNotSupported):
-		http.Error(w, "free reservations cannot use payment checkout", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "FREE_RESERVATION_NOT_SUPPORTED"
+		message = "Free reservations cannot use payment checkout."
 	case errors.Is(err, ErrProviderSessionFailed):
-		http.Error(w, "failed to create checkout session with payment provider", http.StatusBadGateway)
+		status = http.StatusBadGateway
+		code = "PROVIDER_SESSION_FAILED"
+		message = "Failed to create checkout session with payment provider."
 	default:
 		return false
 	}
+
+	h.writeError(w, status, code, message)
 	return true
 }
 
 func (h *Handler) handleWebhookError(w http.ResponseWriter, err error) bool {
+	var (
+		status  int
+		code    string
+		message string
+	)
+
 	switch {
 	case errors.Is(err, ErrInvalidSignature):
-		http.Error(w, "invalid or missing webhook signature", http.StatusUnauthorized)
+		status = http.StatusUnauthorized
+		code = "INVALID_WEBHOOK_SIGNATURE"
+		message = "Invalid or missing webhook signature."
 	case errors.Is(err, ErrStaleTimestamp):
-		http.Error(w, "webhook timestamp outside acceptable window", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "STALE_WEBHOOK_TIMESTAMP"
+		message = "Webhook timestamp outside acceptable window."
 	case errors.Is(err, ErrInvalidPayload):
-		http.Error(w, "invalid webhook payload", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "INVALID_WEBHOOK_PAYLOAD"
+		message = "Invalid webhook payload."
 	case errors.Is(err, ErrPaymentAttemptNotFound):
-		http.Error(w, "payment attempt not found", http.StatusNotFound)
+		status = http.StatusNotFound
+		code = "PAYMENT_ATTEMPT_NOT_FOUND"
+		message = "Payment attempt not found."
 	case errors.Is(err, ErrAmountMismatch), errors.Is(err, ErrCurrencyMismatch):
-		http.Error(w, "amount or currency mismatch", http.StatusBadRequest)
+		status = http.StatusBadRequest
+		code = "PAYMENT_MISMATCH"
+		message = "Amount or currency mismatch."
 	case errors.Is(err, ErrInvalidStateTransition):
-		http.Error(w, "invalid payment state transition", http.StatusConflict)
+		status = http.StatusConflict
+		code = "INVALID_PAYMENT_STATE_TRANSITION"
+		message = "Invalid payment state transition."
 	default:
 		return false
 	}
+
+	h.writeError(w, status, code, message)
 	return true
 }
 
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+func (h *Handler) writeError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	if err := httpresponse.WriteError(
+		w,
+		status,
+		code,
+		message,
+	); err != nil {
+		h.logger.Error("failed to write HTTP error response",
+			"error", err,
+		)
+	}
 }

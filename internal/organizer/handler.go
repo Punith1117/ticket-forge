@@ -1,13 +1,13 @@
 package organizer
 
 import (
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 
 	"github.com/Punith1117/ticket-forge/internal/auth"
 	"github.com/Punith1117/ticket-forge/internal/database/sqlc"
+	"github.com/Punith1117/ticket-forge/internal/httpresponse"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -41,7 +41,7 @@ func (h *Handler) RegisterRoutes(
 func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 	authUser, ok := auth.UserFromContext(r.Context())
 	if !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
 		return
 	}
 
@@ -51,7 +51,7 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		if errors.Is(err, ErrUserNotFound) {
-			http.Error(w, "user not found", http.StatusNotFound)
+			h.writeError(w, http.StatusNotFound, "USER_NOT_FOUND", "User not found.")
 			return
 		}
 
@@ -59,7 +59,7 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 			"user_id", authUser.UserID,
 			"error", err,
 		)
-		http.Error(w, "an unexpected error occurred", http.StatusInternalServerError)
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
 		return
 	}
 
@@ -71,16 +71,32 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 		message = "Organizer profile created successfully."
 	}
 
-	h.writeJSON(w, status, CreateProfileResponse{
+	if err := httpresponse.WriteJSON(w, status, CreateProfileResponse{
 		Message: message,
 		Profile: toProfileResponse(profile),
-	})
+	}); err != nil {
+		h.logger.Error("failed to write organizer profile response",
+			"error", err,
+		)
+	}
 }
 
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+func (h *Handler) writeError(
+	w http.ResponseWriter,
+	status int,
+	code string,
+	message string,
+) {
+	if err := httpresponse.WriteError(
+		w,
+		status,
+		code,
+		message,
+	); err != nil {
+		h.logger.Error("failed to write HTTP error response",
+			"error", err,
+		)
+	}
 }
 
 func toProfileResponse(profile sqlc.OrganizerProfile) ProfileResponse {

@@ -240,12 +240,12 @@ func TestHTTP_Logout_WithoutSession_Returns401(t *testing.T) {
 		t.Errorf("expected 401 for unauthenticated logout, got %d", resp.StatusCode)
 	}
 
-	var errResp auth.ErrorResponse
+	var errResp errorResponse
 	if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if errResp.Error != "unauthorized" {
-		t.Errorf("expected error 'unauthorized', got %q", errResp.Error)
+	if errResp.Error.Code != "UNAUTHORIZED" {
+		t.Errorf("expected error 'UNAUTHORIZED', got %q", errResp.Error)
 	}
 }
 

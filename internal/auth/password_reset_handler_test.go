@@ -27,12 +27,12 @@ func TestHandler_PasswordResetRequest_InvalidJSON(t *testing.T) {
 		t.Errorf("expected 400 Bad Request, got %d", rec.Code)
 	}
 
-	var errResp auth.ErrorResponse
+	var errResp errorResponse
 	if err := json.NewDecoder(rec.Body).Decode(&errResp); err != nil {
 		t.Fatalf("failed to decode error response: %v", err)
 	}
-	if errResp.Error != "invalid_request" {
-		t.Errorf("expected error 'invalid_request', got '%s'", errResp.Error)
+	if errResp.Error.Code != "INVALID_REQUEST" {
+		t.Errorf("expected error 'INVALID_REQUEST', got '%s'", errResp.Error)
 	}
 }
 
@@ -80,10 +80,10 @@ func TestHandler_PasswordResetComplete_EmptyToken(t *testing.T) {
 		t.Errorf("expected 400 Bad Request, got %d", rec.Code)
 	}
 
-	var errResp auth.ErrorResponse
+	var errResp errorResponse
 	_ = json.NewDecoder(rec.Body).Decode(&errResp)
-	if errResp.Error != "invalid_token" {
-		t.Errorf("expected error 'invalid_token', got '%s'", errResp.Error)
+	if errResp.Error.Code != "INVALID_TOKEN" {
+		t.Errorf("expected error 'INVALID_TOKEN', got '%s'", errResp.Error)
 	}
 }
 
@@ -103,10 +103,10 @@ func TestHandler_PasswordResetComplete_InvalidPassword(t *testing.T) {
 		t.Errorf("expected 400 Bad Request, got %d", rec.Code)
 	}
 
-	var errResp auth.ErrorResponse
+	var errResp errorResponse
 	_ = json.NewDecoder(rec.Body).Decode(&errResp)
-	if errResp.Error != "invalid_password" {
-		t.Errorf("expected error 'invalid_password', got '%s'", errResp.Error)
+	if errResp.Error.Code != "INVALID_PASSWORD" {
+		t.Errorf("expected error 'INVALID_PASSWORD', got '%s'", errResp.Error)
 	}
 }
 

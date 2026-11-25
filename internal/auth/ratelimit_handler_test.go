@@ -136,12 +136,12 @@ func TestHandler_RateLimit_RetryAfterHeaderOnDeny(t *testing.T) {
 		t.Errorf("expected Retry-After=42, got %d", secs)
 	}
 	// Body must be generic JSON error; must not expose internal details.
-	var body auth.ErrorResponse
+	var body errorResponse
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatalf("failed to decode body: %v", err)
 	}
-	if body.Error != "too_many_requests" {
-		t.Errorf("expected error code 'too_many_requests', got %q", body.Error)
+	if body.Error.Code != "TOO_MANY_REQUESTS" {
+		t.Errorf("expected error code 'TOO_MANY_REQUESTS', got %q", body.Error)
 	}
 }
 
