@@ -6,6 +6,7 @@ var (
 	ErrMissingTicketCategoryID = errors.New("ticket_category_id is required")
 
 	ErrInvalidEventID          = errors.New("booking: invalid event ID")
+	ErrInvalidReservationID    = errors.New("booking: invalid reservation ID")
 	ErrInvalidTicketCategoryID = errors.New("booking: invalid ticket category ID")
 	ErrInvalidQuantity         = errors.New("booking: quantity must be greater than zero")
 
@@ -21,6 +22,7 @@ var (
 	ErrEventCancelled         = errors.New("booking: event has been cancelled")
 	ErrEventNotEligible       = errors.New("booking: event is not eligible for confirmation")
 	ErrPaymentAttemptMismatch = errors.New("booking: payment attempt does not match reservation")
-	ErrInventoryInconsistent  = errors.New("booking: inventory counters are inconsistent with reservation")
-	ErrBookingAlreadyExists   = errors.New("booking: booking already exists for reservation")
+	ErrInventoryInconsistent       = errors.New("booking: inventory counters are inconsistent with reservation")
+	ErrInconsistentReservationState = errors.New("booking: reservation state is inconsistent")
+	ErrBookingAlreadyExists        = errors.New("booking: booking already exists for reservation")
 )

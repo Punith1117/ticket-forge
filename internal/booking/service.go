@@ -416,3 +416,231 @@ func (s *Service) ConfirmReservationPayment(
 		ReservationID: resUUID.String(),
 	}, nil
 }
+
+// GetReservationStatus retrieves the current reservation, payment, booking, and refund state for polling.
+func (s *Service) GetReservationStatus(
+	ctx context.Context,
+	customerID string,
+	reservationID string,
+) (ReservationStatusResponse, error) {
+	customerUUID, err := uuid.Parse(customerID)
+	if err != nil {
+		return ReservationStatusResponse{}, fmt.Errorf("booking: parse customer ID: %w", err)
+	}
+
+	resUUID, err := uuid.Parse(reservationID)
+	if err != nil {
+		return ReservationStatusResponse{}, ErrInvalidReservationID
+	}
+
+	row, err := s.repository.GetReservationStatusForCustomer(
+		ctx,
+		pgtype.UUID{Bytes: resUUID, Valid: true},
+		pgtype.UUID{Bytes: customerUUID, Valid: true},
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ReservationStatusResponse{}, ErrReservationNotFound
+		}
+		return ReservationStatusResponse{}, err
+	}
+
+	paymentStatus := ""
+	if row.PaymentAttemptID.Valid {
+		paymentStatus = row.PaymentStatus
+	}
+
+	refundStatus := ""
+	if row.RefundID.Valid {
+		refundStatus = row.RefundStatus
+	}
+
+	if row.EffectiveReservationStatus == "confirmed" && !row.BookingID.Valid {
+		return ReservationStatusResponse{}, fmt.Errorf(
+			"%w: confirmed reservation missing booking record",
+			ErrInconsistentReservationState,
+		)
+	}
+	if row.BookingID.Valid && row.EffectiveReservationStatus != "confirmed" {
+		return ReservationStatusResponse{}, fmt.Errorf(
+			"%w: booking record exists for reservation_status=%s",
+			ErrInconsistentReservationState,
+			row.EffectiveReservationStatus,
+		)
+	}
+
+	outcome, isTerminal, err := deriveReservationOutcome(
+		row.EffectiveReservationStatus,
+		paymentStatus,
+		refundStatus,
+	)
+	if err != nil {
+		return ReservationStatusResponse{}, err
+	}
+
+	resp := ReservationStatusResponse{
+		Outcome:    outcome,
+		IsTerminal: isTerminal,
+		Reservation: ReservationSummary{
+			ID:                 uuid.UUID(row.ID.Bytes).String(),
+			EventID:            uuid.UUID(row.EventID.Bytes).String(),
+			TicketCategoryID:   uuid.UUID(row.TicketCategoryID.Bytes).String(),
+			Quantity:           row.Quantity,
+			UnitPriceMinor:     row.UnitPriceMinor,
+			TotalPriceMinor:    row.TotalPriceMinor,
+			Currency:           row.Currency,
+			Status:             row.EffectiveReservationStatus,
+			CancellationReason: textPtr(row.CancellationReason),
+			ExpiresAt:          row.ExpiresAt.Time,
+			CreatedAt:          row.CreatedAt.Time,
+			UpdatedAt:          row.UpdatedAt.Time,
+		},
+	}
+
+	if row.PaymentAttemptID.Valid {
+		resp.Payment = &PaymentSummary{
+			AttemptID:     uuid.UUID(row.PaymentAttemptID.Bytes).String(),
+			Status:        row.PaymentStatus,
+			Provider:      row.PaymentProvider,
+			AmountMinor:   row.PaymentAmountMinor,
+			Currency:      row.PaymentCurrency,
+			FailureReason: textPtr(row.PaymentFailureReason),
+			AttemptedAt:   row.PaymentAttemptedAt.Time,
+			CompletedAt:   timePtr(row.PaymentCompletedAt),
+		}
+	}
+
+	if row.BookingID.Valid {
+		resp.Booking = &BookingSummary{
+			ID:          uuid.UUID(row.BookingID.Bytes).String(),
+			Status:      row.BookingStatus.String,
+			ConfirmedAt: row.BookingConfirmedAt.Time,
+		}
+	}
+
+	if row.RefundID.Valid {
+		resp.Refund = &RefundSummary{
+			ID:            uuid.UUID(row.RefundID.Bytes).String(),
+			Status:        row.RefundStatus,
+			AmountMinor:   row.RefundAmountMinor,
+			Currency:      row.RefundCurrency,
+			FailureReason: textPtr(row.RefundFailureReason),
+			CreatedAt:     row.RefundCreatedAt.Time,
+			CompletedAt:   timePtr(row.RefundCompletedAt),
+		}
+	}
+
+	return resp, nil
+}
+
+func deriveReservationOutcome(
+	reservationStatus string,
+	paymentStatus string,
+	refundStatus string,
+) (ReservationOutcome, bool, error) {
+	// 1. Refund present: must only occur when payment succeeded and reservation is not held.
+	if refundStatus != "" {
+		if paymentStatus != "succeeded" || reservationStatus == "held" {
+			return "", false, fmt.Errorf(
+				"%w: refund_status=%s with reservation_status=%s payment_status=%s",
+				ErrInconsistentReservationState,
+				refundStatus,
+				reservationStatus,
+				paymentStatus,
+			)
+		}
+
+		switch reservationStatus {
+		case "confirmed", "expired", "cancelled":
+		default:
+			return "", false, fmt.Errorf(
+				"%w: unknown reservation_status=%s",
+				ErrInconsistentReservationState,
+				reservationStatus,
+			)
+		}
+
+		switch refundStatus {
+		case "pending", "processing":
+			return OutcomeRefundPending, false, nil
+		case "succeeded":
+			return OutcomeRefunded, true, nil
+		case "failed":
+			return OutcomeRefundFailed, true, nil
+		default:
+			return "", false, fmt.Errorf(
+				"%w: unknown refund_status=%s",
+				ErrInconsistentReservationState,
+				refundStatus,
+			)
+		}
+	}
+
+	// 2. Successful payment without a refund record yet.
+	if paymentStatus == "succeeded" {
+		switch reservationStatus {
+		case "confirmed":
+			return OutcomeConfirmed, true, nil
+		case "expired", "cancelled":
+			return OutcomeRefundPending, false, nil
+		case "held":
+			return "", false, fmt.Errorf(
+				"%w: payment succeeded while reservation is still held",
+				ErrInconsistentReservationState,
+			)
+		default:
+			return "", false, fmt.Errorf(
+				"%w: unknown reservation_status=%s",
+				ErrInconsistentReservationState,
+				reservationStatus,
+			)
+		}
+	}
+
+	// 3. No succeeded payment (unpaid, pending, or failed).
+	switch paymentStatus {
+	case "", "pending", "failed":
+	default:
+		return "", false, fmt.Errorf(
+			"%w: unknown payment_status=%s",
+			ErrInconsistentReservationState,
+			paymentStatus,
+		)
+	}
+
+	switch reservationStatus {
+	case "held":
+		return OutcomePending, false, nil
+	case "expired":
+		return OutcomeExpired, true, nil
+	case "cancelled":
+		return OutcomeCancelled, true, nil
+	case "confirmed":
+		return "", false, fmt.Errorf(
+			"%w: reservation confirmed without a succeeded payment",
+			ErrInconsistentReservationState,
+		)
+	default:
+		return "", false, fmt.Errorf(
+			"%w: unknown reservation_status=%s",
+			ErrInconsistentReservationState,
+			reservationStatus,
+		)
+	}
+}
+
+func textPtr(v pgtype.Text) *string {
+	if !v.Valid {
+		return nil
+	}
+	s := v.String
+	return &s
+}
+
+func timePtr(v pgtype.Timestamptz) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	t := v.Time
+	return &t
+}

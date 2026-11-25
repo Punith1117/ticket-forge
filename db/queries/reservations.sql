@@ -98,16 +98,90 @@ WHERE id = @id
 FOR UPDATE;
 
 -- name: GetReservationStatusForCustomer :one
--- Lightweight query for the frontend polling endpoint.
+-- Composite status query for the frontend polling endpoint.
 SELECT
-    id,
-    status,
-    expires_at,
-    created_at,
-    updated_at
-FROM reservations
-WHERE id = @id
-  AND customer_id = @customer_id;
+    r.id,
+    r.customer_id,
+    tc.event_id,
+    r.ticket_category_id,
+    r.quantity,
+    r.unit_price_minor,
+    r.total_price_minor,
+    r.currency,
+    CASE
+        WHEN r.status = 'held' AND r.expires_at <= clock_timestamp() THEN 'expired'
+        ELSE r.status
+    END::text AS effective_reservation_status,
+    r.cancellation_reason,
+    r.expires_at,
+    r.created_at,
+    r.updated_at,
+
+    b.id AS booking_id,
+    b.status AS booking_status,
+    b.confirmed_at AS booking_confirmed_at,
+
+    pa.id AS payment_attempt_id,
+    COALESCE(pa.status, '')::text AS payment_status,
+    COALESCE(pa.provider, '')::text AS payment_provider,
+    COALESCE(pa.amount_minor, 0)::bigint AS payment_amount_minor,
+    COALESCE(pa.currency, '')::text AS payment_currency,
+    pa.failure_reason AS payment_failure_reason,
+    pa.attempted_at AS payment_attempted_at,
+    pa.completed_at AS payment_completed_at,
+
+    rf.id AS refund_id,
+    COALESCE(rf.status, '')::text AS refund_status,
+    COALESCE(rf.amount_minor, 0)::bigint AS refund_amount_minor,
+    COALESCE(rf.currency, '')::text AS refund_currency,
+    rf.failure_reason AS refund_failure_reason,
+    rf.created_at AS refund_created_at,
+    rf.completed_at AS refund_completed_at
+FROM reservations AS r
+JOIN ticket_categories AS tc
+    ON tc.id = r.ticket_category_id
+LEFT JOIN bookings AS b
+    ON b.reservation_id = r.id
+LEFT JOIN LATERAL (
+    SELECT
+        p.id,
+        p.status,
+        p.provider,
+        p.amount_minor,
+        p.currency,
+        p.failure_reason,
+        p.attempted_at,
+        p.completed_at
+    FROM payment_attempts AS p
+    WHERE p.reservation_id = r.id
+    ORDER BY
+        CASE p.status
+            WHEN 'succeeded' THEN 1
+            WHEN 'pending' THEN 2
+            ELSE 3
+        END,
+        p.attempted_at DESC,
+        p.id DESC
+    LIMIT 1
+) AS pa ON true
+LEFT JOIN LATERAL (
+    SELECT
+        rfd.id,
+        rfd.status,
+        rfd.amount_minor,
+        rfd.currency,
+        rfd.failure_reason,
+        rfd.created_at,
+        rfd.completed_at
+    FROM refunds AS rfd
+    WHERE rfd.payment_attempt_id = pa.id
+       OR (b.id IS NOT NULL AND rfd.booking_id = b.id)
+    ORDER BY rfd.created_at DESC
+    LIMIT 1
+) AS rf ON true
+WHERE r.id = @id
+  AND r.customer_id = @customer_id
+LIMIT 1;
 
 -- ============================================================
 -- RESERVATION EXPIRATION

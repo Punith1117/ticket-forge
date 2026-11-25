@@ -401,3 +401,170 @@ func TestCreateReservation_InsufficientInventory(t *testing.T) {
 		)
 	}
 }
+
+func TestGetReservationStatus_LifecycleStates(t *testing.T) {
+	f := setupBookingIntegrationDB(t)
+	ctx := context.Background()
+
+	createHeld := func(qty int32) booking.CreateReservationResponse {
+		t.Helper()
+		res, err := f.service.CreateReservation(
+			ctx,
+			f.customerID,
+			f.eventID,
+			booking.CreateReservationRequest{
+				TicketCategoryID: f.categoryID,
+				Quantity:         qty,
+			},
+			uuid.NewString(),
+		)
+		if err != nil {
+			t.Fatalf("failed to create reservation: %v", err)
+		}
+		return res
+	}
+
+	// 1. Held & unpaid -> PENDING, non-terminal, payment nil
+	res := createHeld(1)
+	status, err := f.service.GetReservationStatus(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(held unpaid) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomePending || status.IsTerminal {
+		t.Fatalf("expected PENDING/non-terminal, got %s/%v", status.Outcome, status.IsTerminal)
+	}
+	if status.Reservation.Status != "held" || status.Payment != nil || status.Booking != nil || status.Refund != nil {
+		t.Fatalf("unexpected sub-objects for held unpaid: %+v", status)
+	}
+
+	// 2. Ownership isolation -> ErrReservationNotFound for another customer
+	otherCustomerID := uuid.NewString()
+	if _, err := f.service.GetReservationStatus(ctx, otherCustomerID, res.ID); !errors.Is(err, booking.ErrReservationNotFound) {
+		t.Fatalf("expected ErrReservationNotFound for other customer, got %v", err)
+	}
+
+	// 3. Held & payment pending -> PENDING, Payment != nil
+	attempt1 := uuid.NewString()
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO payment_attempts (id, reservation_id, amount_minor, currency, status, provider, provider_order_reference)
+		VALUES ($1, $2, 50000, 'INR', 'pending', 'simulator', $3)
+	`, attempt1, res.ID, "ord_"+attempt1)
+	if err != nil {
+		t.Fatalf("failed to insert pending payment attempt: %v", err)
+	}
+
+	status, err = f.service.GetReservationStatus(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(held pending) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomePending || status.IsTerminal || status.Payment == nil || status.Payment.Status != "pending" {
+		t.Fatalf("unexpected status for held pending: %+v", status)
+	}
+
+	// 4. Held & payment failed -> PENDING (user can retry)
+	_, err = f.pool.Exec(ctx, `
+		UPDATE payment_attempts SET status = 'failed', failure_reason = 'declined', completed_at = now()
+		WHERE id = $1
+	`, attempt1)
+	if err != nil {
+		t.Fatalf("failed to update payment attempt to failed: %v", err)
+	}
+
+	status, err = f.service.GetReservationStatus(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(held failed) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomePending || status.IsTerminal || status.Payment == nil || status.Payment.Status != "failed" {
+		t.Fatalf("unexpected status for held failed: %+v", status)
+	}
+
+	// 5. Held but expires_at <= clock_timestamp() -> EXPIRED (effective status)
+	_, err = f.pool.Exec(ctx, `
+		UPDATE reservations SET expires_at = now() - interval '1 minute' WHERE id = $1
+	`, res.ID)
+	if err != nil {
+		t.Fatalf("failed to backdate reservation expires_at: %v", err)
+	}
+
+	status, err = f.service.GetReservationStatus(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(clock expired) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomeExpired || !status.IsTerminal || status.Reservation.Status != "expired" {
+		t.Fatalf("unexpected status for clock expired: %+v", status)
+	}
+
+	// 6. Expired & payment succeeded & refund pending -> REFUND_PENDING -> REFUNDED
+	attempt2 := uuid.NewString()
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO payment_attempts (id, reservation_id, amount_minor, currency, status, provider, provider_order_reference, completed_at)
+		VALUES ($1, $2, 50000, 'INR', 'succeeded', 'simulator', $3, now())
+	`, attempt2, res.ID, "ord_"+attempt2)
+	if err != nil {
+		t.Fatalf("failed to insert succeeded payment attempt: %v", err)
+	}
+	refundID := uuid.NewString()
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO refunds (id, payment_attempt_id, amount_minor, currency, status)
+		VALUES ($1, $2, 50000, 'INR', 'pending')
+	`, refundID, attempt2)
+	if err != nil {
+		t.Fatalf("failed to insert refund: %v", err)
+	}
+
+	status, err = f.service.GetReservationStatus(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(refund pending) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomeRefundPending || status.IsTerminal || status.Refund == nil || status.Refund.Status != "pending" {
+		t.Fatalf("unexpected status for refund pending: %+v", status)
+	}
+
+	_, err = f.pool.Exec(ctx, `
+		UPDATE refunds SET status = 'succeeded', completed_at = now() WHERE id = $1
+	`, refundID)
+	if err != nil {
+		t.Fatalf("failed to mark refund succeeded: %v", err)
+	}
+
+	status, err = f.service.GetReservationStatus(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(refunded) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomeRefunded || !status.IsTerminal || status.Refund == nil || status.Refund.Status != "succeeded" {
+		t.Fatalf("unexpected status for refunded: %+v", status)
+	}
+
+	// 7. Confirmed reservation with booking -> CONFIRMED
+	res2 := createHeld(1)
+	attempt3 := uuid.NewString()
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO payment_attempts (id, reservation_id, amount_minor, currency, status, provider, provider_order_reference, completed_at)
+		VALUES ($1, $2, 50000, 'INR', 'succeeded', 'simulator', $3, now())
+	`, attempt3, res2.ID, "ord_"+attempt3)
+	if err != nil {
+		t.Fatalf("failed to insert succeeded payment attempt for res2: %v", err)
+	}
+
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	confirmRes, err := f.service.ConfirmReservationPayment(ctx, tx, res2.ID, attempt3)
+	if err != nil || confirmRes.Status != booking.ConfirmationStatusConfirmed {
+		t.Fatalf("ConfirmReservationPayment failed: res=%+v err=%v", confirmRes, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("failed to commit tx: %v", err)
+	}
+
+	status, err = f.service.GetReservationStatus(ctx, f.customerID, res2.ID)
+	if err != nil {
+		t.Fatalf("GetReservationStatus(confirmed) failed: %v", err)
+	}
+	if status.Outcome != booking.OutcomeConfirmed || !status.IsTerminal || status.Booking == nil || status.Booking.ID != confirmRes.BookingID {
+		t.Fatalf("unexpected status for confirmed: %+v", status)
+	}
+}

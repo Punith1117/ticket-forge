@@ -97,7 +97,7 @@ type Querier interface {
 	// Must be called after locking the associated event.
 	GetReservationForUpdate(ctx context.Context, id pgtype.UUID) (Reservation, error)
 	GetReservationLifecycleReference(ctx context.Context, id pgtype.UUID) (GetReservationLifecycleReferenceRow, error)
-	// Lightweight query for the frontend polling endpoint.
+	// Composite status query for the frontend polling endpoint.
 	GetReservationStatusForCustomer(ctx context.Context, arg GetReservationStatusForCustomerParams) (GetReservationStatusForCustomerRow, error)
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (Session, error)
 	GetTicketCategoryInventory(ctx context.Context, ticketCategoryID pgtype.UUID) (GetTicketCategoryInventoryRow, error)

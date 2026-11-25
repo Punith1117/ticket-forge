@@ -35,6 +35,10 @@ func (h *Handler) RegisterRoutes(
 		"POST /api/v1/events/{eventID}/reservations",
 		authHandler.RequireAuth(h.CreateReservation),
 	)
+	mux.HandleFunc(
+		"GET /api/v1/reservations/{reservationID}",
+		authHandler.RequireAuth(h.GetReservationStatus),
+	)
 }
 
 func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +92,42 @@ func (h *Handler) CreateReservation(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *Handler) GetReservationStatus(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		h.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "Authentication required.")
+		return
+	}
+
+	reservationID := r.PathValue("reservationID")
+
+	response, err := h.service.GetReservationStatus(
+		r.Context(),
+		authUser.UserID,
+		reservationID,
+	)
+	if err != nil {
+		if h.handleServiceError(w, err) {
+			return
+		}
+
+		h.logger.Error("failed to get reservation status",
+			"user_id", authUser.UserID,
+			"reservation_id", reservationID,
+			"error", err,
+		)
+
+		h.writeError(w, http.StatusInternalServerError, "INTERNAL_SERVER_ERROR", "An unexpected error occurred.")
+		return
+	}
+
+	if err := httpresponse.WriteJSON(w, http.StatusOK, response); err != nil {
+		h.logger.Error("failed to write reservation status response",
+			"error", err,
+		)
+	}
+}
+
 func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
 	var (
 		status  int
@@ -102,11 +142,17 @@ func (h *Handler) handleServiceError(w http.ResponseWriter, err error) bool {
 		message = "ticket_category_id is required."
 
 	case errors.Is(err, ErrInvalidEventID),
+		errors.Is(err, ErrInvalidReservationID),
 		errors.Is(err, ErrInvalidTicketCategoryID),
 		errors.Is(err, ErrInvalidQuantity):
 		status = http.StatusBadRequest
 		code = "INVALID_RESERVATION_REQUEST"
 		message = err.Error()
+
+	case errors.Is(err, ErrReservationNotFound):
+		status = http.StatusNotFound
+		code = "RESERVATION_NOT_FOUND"
+		message = "Reservation not found."
 
 	case errors.Is(err, idempotency.ErrInvalidRequest):
 		status = http.StatusBadRequest

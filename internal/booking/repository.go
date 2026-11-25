@@ -270,3 +270,25 @@ func (r *Repository) GetPaymentAttemptByID(
 	}
 	return attempt, nil
 }
+
+func (r *Repository) GetReservationStatusForCustomer(
+	ctx context.Context,
+	reservationID pgtype.UUID,
+	customerID pgtype.UUID,
+) (sqlc.GetReservationStatusForCustomerRow, error) {
+	row, err := sqlc.New(r.pool).GetReservationStatusForCustomer(
+		ctx,
+		sqlc.GetReservationStatusForCustomerParams{
+			ID:         reservationID,
+			CustomerID: customerID,
+		},
+	)
+	if err != nil {
+		return sqlc.GetReservationStatusForCustomerRow{}, fmt.Errorf(
+			"booking: get reservation status: %w",
+			err,
+		)
+	}
+
+	return row, nil
+}

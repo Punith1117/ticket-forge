@@ -38,6 +38,18 @@ func TestHandleServiceError(t *testing.T) {
 			wantStatusCode: http.StatusBadRequest,
 		},
 		{
+			name:           "invalid reservation ID",
+			err:            ErrInvalidReservationID,
+			wantHandled:    true,
+			wantStatusCode: http.StatusBadRequest,
+		},
+		{
+			name:           "reservation not found",
+			err:            ErrReservationNotFound,
+			wantHandled:    true,
+			wantStatusCode: http.StatusNotFound,
+		},
+		{
 			name:           "invalid ticket category ID",
 			err:            ErrInvalidTicketCategoryID,
 			wantHandled:    true,
@@ -127,6 +139,28 @@ func TestCreateReservation_RequiresAuthentication(t *testing.T) {
 	recorder := httptest.NewRecorder()
 
 	handler.CreateReservation(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusUnauthorized,
+			recorder.Code,
+		)
+	}
+}
+
+func TestGetReservationStatus_RequiresAuthentication(t *testing.T) {
+	handler := NewHandler(nil, nil)
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/reservations/test-reservation-id",
+		nil,
+	)
+
+	recorder := httptest.NewRecorder()
+
+	handler.GetReservationStatus(recorder, req)
 
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf(
