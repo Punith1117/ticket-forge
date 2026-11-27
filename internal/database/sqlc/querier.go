@@ -62,6 +62,9 @@ type Querier interface {
 	// Must be called after locking the associated event and ticket category.
 	// Returns the total quantity that must be released from inventory.
 	ExpireExpiredReservationsForCategory(ctx context.Context, ticketCategoryID pgtype.UUID) (int32, error)
+	// Claims a bounded batch of expired held reservations using SKIP LOCKED,
+	// marks them expired, and returns the released quantity and count aggregated by category.
+	ExpireHeldReservationsBatch(ctx context.Context, limitCount int32) ([]ExpireHeldReservationsBatchRow, error)
 	ExpireInitializingPaymentAttempt(ctx context.Context, arg ExpireInitializingPaymentAttemptParams) (PaymentAttempt, error)
 	ExpirePaymentAttempt(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error)
 	// Only expires a reservation that is still held and past its deadline.

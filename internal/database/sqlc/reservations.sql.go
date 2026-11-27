@@ -179,6 +179,64 @@ func (q *Queries) ExpireExpiredReservationsForCategory(ctx context.Context, tick
 	return released_quantity, err
 }
 
+const expireHeldReservationsBatch = `-- name: ExpireHeldReservationsBatch :many
+WITH candidate_reservations AS (
+    SELECT r.id, r.ticket_category_id, r.quantity
+    FROM reservations r
+    WHERE r.status = 'held'
+      AND r.expires_at <= now()
+    ORDER BY r.expires_at ASC
+    LIMIT $1
+    FOR UPDATE OF r SKIP LOCKED
+),
+expired_reservations AS (
+    UPDATE reservations r
+    SET
+        status = 'expired',
+        updated_at = now()
+    FROM candidate_reservations cr
+    WHERE r.id = cr.id
+      AND r.status = 'held'
+      AND r.expires_at <= now()
+    RETURNING r.id, r.ticket_category_id, r.quantity
+)
+SELECT
+    ticket_category_id,
+    SUM(quantity)::integer AS released_quantity,
+    COUNT(*)::integer AS expired_count
+FROM expired_reservations
+GROUP BY ticket_category_id
+ORDER BY ticket_category_id ASC
+`
+
+type ExpireHeldReservationsBatchRow struct {
+	TicketCategoryID pgtype.UUID `db:"ticket_category_id" json:"ticket_category_id"`
+	ReleasedQuantity int32       `db:"released_quantity" json:"released_quantity"`
+	ExpiredCount     int32       `db:"expired_count" json:"expired_count"`
+}
+
+// Claims a bounded batch of expired held reservations using SKIP LOCKED,
+// marks them expired, and returns the released quantity and count aggregated by category.
+func (q *Queries) ExpireHeldReservationsBatch(ctx context.Context, limitCount int32) ([]ExpireHeldReservationsBatchRow, error) {
+	rows, err := q.db.Query(ctx, expireHeldReservationsBatch, limitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ExpireHeldReservationsBatchRow{}
+	for rows.Next() {
+		var i ExpireHeldReservationsBatchRow
+		if err := rows.Scan(&i.TicketCategoryID, &i.ReleasedQuantity, &i.ExpiredCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const expireReservation = `-- name: ExpireReservation :execrows
 UPDATE reservations
 SET

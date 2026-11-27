@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Punith1117/ticket-forge/internal/booking"
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
 	"github.com/Punith1117/ticket-forge/internal/email"
@@ -109,12 +110,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 7. Graceful Shutdown on OS Signal
+	// 7. Reservation Expiration Worker
+	expirationCfg := booking.ExpirationWorkerConfigFromEnv()
+	if err := expirationCfg.Validate(); err != nil {
+		logger.Error("Invalid reservation expiration worker configuration", "error", err)
+		os.Exit(1)
+	}
+	expirationWorker, err := booking.NewExpirationWorker(pool, expirationCfg, logger)
+	if err != nil {
+		logger.Error("Failed to initialize reservation expiration worker", "error", err)
+		os.Exit(1)
+	}
+
+	// 8. Graceful Shutdown on OS Signal
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 
 	go func() {
 		defer wg.Done()
@@ -134,6 +147,13 @@ func main() {
 		defer wg.Done()
 		if err := cancellationWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("Cancellation worker run error", "error", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := expirationWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("Reservation expiration worker run error", "error", err)
 		}
 	}()
 

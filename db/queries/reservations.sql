@@ -226,6 +226,37 @@ WHERE id = @id
   AND status = 'held'
   AND expires_at <= clock_timestamp();
 
+-- name: ExpireHeldReservationsBatch :many
+-- Claims a bounded batch of expired held reservations using SKIP LOCKED,
+-- marks them expired, and returns the released quantity and count aggregated by category.
+WITH candidate_reservations AS (
+    SELECT r.id, r.ticket_category_id, r.quantity
+    FROM reservations r
+    WHERE r.status = 'held'
+      AND r.expires_at <= now()
+    ORDER BY r.expires_at ASC
+    LIMIT @limit_count
+    FOR UPDATE OF r SKIP LOCKED
+),
+expired_reservations AS (
+    UPDATE reservations r
+    SET
+        status = 'expired',
+        updated_at = now()
+    FROM candidate_reservations cr
+    WHERE r.id = cr.id
+      AND r.status = 'held'
+      AND r.expires_at <= now()
+    RETURNING r.id, r.ticket_category_id, r.quantity
+)
+SELECT
+    ticket_category_id,
+    SUM(quantity)::integer AS released_quantity,
+    COUNT(*)::integer AS expired_count
+FROM expired_reservations
+GROUP BY ticket_category_id
+ORDER BY ticket_category_id ASC;
+
 -- name: DecrementReservedInventory :execrows
 -- Releases the inventory allocated to an expired reservation.
 UPDATE inventory

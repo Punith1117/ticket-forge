@@ -151,6 +151,18 @@ func (r *Repository) ExpireExpiredReservationsForCategory(
 	return releasedQuantity, nil
 }
 
+func (r *Repository) ExpireHeldReservationsBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	limitCount int32,
+) ([]sqlc.ExpireHeldReservationsBatchRow, error) {
+	rows, err := sqlc.New(tx).ExpireHeldReservationsBatch(ctx, limitCount)
+	if err != nil {
+		return nil, fmt.Errorf("booking: expire held reservations batch: %w", err)
+	}
+	return rows, nil
+}
+
 func (r *Repository) DecrementReservedInventory(
 	ctx context.Context,
 	tx pgx.Tx,
