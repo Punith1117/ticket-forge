@@ -35,6 +35,10 @@ var (
 		"event is not active",
 	)
 
+	ErrEventAlreadyCancelled = errors.New(
+		"event: event is already cancelled",
+	)
+
 	ErrInvalidBookingStatus = errors.New(
 		"invalid booking status",
 	)

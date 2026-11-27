@@ -131,6 +131,10 @@ func (h *Handler) handleCheckoutError(w http.ResponseWriter, err error) bool {
 		status = http.StatusConflict
 		code = "RESERVATION_EXPIRED"
 		message = "Reservation has expired."
+	case errors.Is(err, ErrEventCancelled):
+		status = http.StatusConflict
+		code = "EVENT_CANCELLED"
+		message = "Event has been cancelled."
 	case errors.Is(err, ErrFreeReservationNotSupported):
 		status = http.StatusBadRequest
 		code = "FREE_RESERVATION_NOT_SUPPORTED"

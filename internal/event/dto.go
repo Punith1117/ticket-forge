@@ -53,3 +53,26 @@ type UpdateBookingStatusResponse struct {
 	Message string        `json:"message"`
 	Event   EventResponse `json:"event"`
 }
+
+type CancelEventRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+type CancelEventResponse struct {
+	Message string        `json:"message"`
+	Event   EventResponse `json:"event"`
+}
+
+type EventCancellationSummaryResponse struct {
+	EventID                  string `json:"event_id"`
+	Status                   string `json:"status"`
+	BookingStatus            string `json:"booking_status"`
+	TotalBookings            int64  `json:"total_bookings"`
+	CancelledBookings        int64  `json:"cancelled_bookings"`
+	CancelledReservations    int64  `json:"cancelled_reservations"`
+	RefundsPending           int64  `json:"refunds_pending"`
+	RefundsProcessing        int64  `json:"refunds_processing"`
+	RefundsSucceeded         int64  `json:"refunds_succeeded"`
+	RefundsFailed            int64  `json:"refunds_failed"`
+	TotalRefundedAmountMinor int64  `json:"total_refunded_amount_minor"`
+}

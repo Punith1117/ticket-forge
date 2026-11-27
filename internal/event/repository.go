@@ -204,3 +204,48 @@ func (r *Repository) CreateInventory(
 
 	return nil
 }
+
+// CancelEvent updates an active event's status to 'cancelled' and booking_status to 'paused'.
+func (r *Repository) CancelEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	params sqlc.CancelEventParams,
+) (sqlc.Event, error) {
+	cancelledEvent, err := sqlc.New(tx).CancelEvent(ctx, params)
+	if err != nil {
+		return sqlc.Event{}, fmt.Errorf("event: cancel event: %w", err)
+	}
+
+	return cancelledEvent, nil
+}
+
+// InsertOutboxEvent inserts a transactional outbox event.
+func (r *Repository) InsertOutboxEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	params sqlc.InsertOutboxEventParams,
+) (sqlc.OutboxEvent, error) {
+	outboxEvent, err := sqlc.New(tx).InsertOutboxEvent(ctx, params)
+	if err != nil {
+		return sqlc.OutboxEvent{}, fmt.Errorf("event: insert outbox event: %w", err)
+	}
+
+	return outboxEvent, nil
+}
+
+// GetEventCancellationSummary retrieves cancellation and refund progress metrics.
+func (r *Repository) GetEventCancellationSummary(
+	ctx context.Context,
+	eventID pgtype.UUID,
+	organizerProfileID pgtype.UUID,
+) (sqlc.GetEventCancellationSummaryRow, error) {
+	summary, err := sqlc.New(r.pool).GetEventCancellationSummary(ctx, sqlc.GetEventCancellationSummaryParams{
+		ID:                 eventID,
+		OrganizerProfileID: organizerProfileID,
+	})
+	if err != nil {
+		return sqlc.GetEventCancellationSummaryRow{}, fmt.Errorf("event: get cancellation summary: %w", err)
+	}
+
+	return summary, nil
+}

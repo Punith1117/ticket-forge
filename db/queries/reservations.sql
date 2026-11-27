@@ -286,3 +286,30 @@ SET
 WHERE ticket_category_id = @ticket_category_id
   AND reserved_quantity >= @quantity;
 
+-- name: InvalidateHeldReservationsForEventBatch :many
+WITH candidate_reservations AS (
+    SELECT r.id, r.ticket_category_id, r.quantity
+    FROM reservations r
+    JOIN ticket_categories tc ON tc.id = r.ticket_category_id
+    WHERE tc.event_id = @event_id
+      AND r.status = 'held'
+    ORDER BY r.id ASC
+    LIMIT @limit_count
+    FOR UPDATE OF r SKIP LOCKED
+),
+cancelled_reservations AS (
+    UPDATE reservations r
+    SET
+        status = 'cancelled',
+        cancellation_reason = COALESCE(sqlc.narg('cancellation_reason'), 'event_cancelled'),
+        updated_at = clock_timestamp()
+    FROM candidate_reservations cr
+    WHERE r.id = cr.id
+    RETURNING r.ticket_category_id, r.quantity
+)
+SELECT
+    ticket_category_id,
+    SUM(quantity)::integer AS released_quantity
+FROM cancelled_reservations
+GROUP BY ticket_category_id;
+

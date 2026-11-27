@@ -8,6 +8,7 @@ var (
 	ErrReservationNotHeld          = errors.New("payment: reservation is not in held status")
 	ErrReservationExpired          = errors.New("payment: reservation has expired")
 	ErrFreeReservationNotSupported = errors.New("payment: free reservations cannot use checkout payment")
+	ErrEventCancelled              = errors.New("payment: event has been cancelled")
 
 	ErrPaymentAttemptNotFound = errors.New("payment: payment attempt not found")
 	ErrCheckoutInProgress     = errors.New("payment: checkout session initialization is in progress")

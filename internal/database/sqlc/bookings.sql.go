@@ -11,6 +11,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelBookingsBatch = `-- name: CancelBookingsBatch :execrows
+UPDATE bookings
+SET
+    status = 'cancelled'
+WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) CancelBookingsBatch(ctx context.Context, bookingIds []pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelBookingsBatch, bookingIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createBooking = `-- name: CreateBooking :one
 
 INSERT INTO bookings (
@@ -131,4 +146,63 @@ func (q *Queries) GetBookingByReservationID(ctx context.Context, reservationID p
 		&i.PaymentAttemptID,
 	)
 	return i, err
+}
+
+const getConfirmedBookingsForEventBatch = `-- name: GetConfirmedBookingsForEventBatch :many
+SELECT
+    b.id,
+    b.reservation_id,
+    b.payment_attempt_id,
+    b.customer_id,
+    b.total_price_minor,
+    b.currency
+FROM bookings b
+JOIN reservations r ON r.id = b.reservation_id
+JOIN ticket_categories tc ON tc.id = r.ticket_category_id
+WHERE tc.event_id = $1
+  AND b.status = 'confirmed'
+ORDER BY b.id ASC
+LIMIT $2
+FOR UPDATE OF b SKIP LOCKED
+`
+
+type GetConfirmedBookingsForEventBatchParams struct {
+	EventID    pgtype.UUID `db:"event_id" json:"event_id"`
+	LimitCount int32       `db:"limit_count" json:"limit_count"`
+}
+
+type GetConfirmedBookingsForEventBatchRow struct {
+	ID               pgtype.UUID `db:"id" json:"id"`
+	ReservationID    pgtype.UUID `db:"reservation_id" json:"reservation_id"`
+	PaymentAttemptID pgtype.UUID `db:"payment_attempt_id" json:"payment_attempt_id"`
+	CustomerID       pgtype.UUID `db:"customer_id" json:"customer_id"`
+	TotalPriceMinor  int64       `db:"total_price_minor" json:"total_price_minor"`
+	Currency         string      `db:"currency" json:"currency"`
+}
+
+func (q *Queries) GetConfirmedBookingsForEventBatch(ctx context.Context, arg GetConfirmedBookingsForEventBatchParams) ([]GetConfirmedBookingsForEventBatchRow, error) {
+	rows, err := q.db.Query(ctx, getConfirmedBookingsForEventBatch, arg.EventID, arg.LimitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetConfirmedBookingsForEventBatchRow{}
+	for rows.Next() {
+		var i GetConfirmedBookingsForEventBatchRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ReservationID,
+			&i.PaymentAttemptID,
+			&i.CustomerID,
+			&i.TotalPriceMinor,
+			&i.Currency,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

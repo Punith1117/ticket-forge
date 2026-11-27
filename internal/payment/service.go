@@ -91,7 +91,28 @@ func (s *Service) CreateCheckoutSession(
 		_ = tx.Rollback(context.Background())
 	}()
 
-	// 1. Lock reservation row to serialize concurrent checkout initiations for the same reservation
+	// 1. Follow canonical lock order: Event -> Reservation -> PaymentAttempt.
+	// Verify that the event is active before allowing checkout session creation.
+	ref, err := s.repository.GetReservationLifecycleReferenceTx(ctx, tx, reservationDBID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CheckoutSessionResponse{}, ErrReservationNotFound
+		}
+		return CheckoutSessionResponse{}, fmt.Errorf("payment: get reservation reference: %w", err)
+	}
+
+	eventRow, err := s.repository.LockEventForReservationLifecycleTx(ctx, tx, ref.EventID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return CheckoutSessionResponse{}, ErrReservationNotFound
+		}
+		return CheckoutSessionResponse{}, fmt.Errorf("payment: lock event: %w", err)
+	}
+	if eventRow.Status != "active" {
+		return CheckoutSessionResponse{}, ErrEventCancelled
+	}
+
+	// 2. Lock reservation row to serialize concurrent checkout initiations for the same reservation
 	reservation, err := s.repository.GetReservationForUpdateTx(ctx, tx, reservationDBID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -12,6 +12,8 @@ import (
 
 type Querier interface {
 	ActivatePaymentAttemptSession(ctx context.Context, arg ActivatePaymentAttemptSessionParams) (PaymentAttempt, error)
+	CancelBookingsBatch(ctx context.Context, bookingIds []pgtype.UUID) (int64, error)
+	CancelEvent(ctx context.Context, arg CancelEventParams) (Event, error)
 	CancelVenueBooking(ctx context.Context, arg CancelVenueBookingParams) (CancelVenueBookingRow, error)
 	ClaimOutboxEvents(ctx context.Context, arg ClaimOutboxEventsParams) ([]OutboxEvent, error)
 	ClaimPendingRefunds(ctx context.Context, arg ClaimPendingRefundsParams) ([]Refund, error)
@@ -73,7 +75,9 @@ type Querier interface {
 	GetActiveVenueForBooking(ctx context.Context, id pgtype.UUID) (GetActiveVenueForBookingRow, error)
 	GetBookingByID(ctx context.Context, id pgtype.UUID) (Booking, error)
 	GetBookingByReservationID(ctx context.Context, reservationID pgtype.UUID) (Booking, error)
+	GetConfirmedBookingsForEventBatch(ctx context.Context, arg GetConfirmedBookingsForEventBatchParams) ([]GetConfirmedBookingsForEventBatchRow, error)
 	GetEventByID(ctx context.Context, id pgtype.UUID) (Event, error)
+	GetEventCancellationSummary(ctx context.Context, arg GetEventCancellationSummaryParams) (GetEventCancellationSummaryRow, error)
 	// ============================================================
 	// RESERVATION EXPIRATION
 	// ============================================================
@@ -120,6 +124,7 @@ type Querier interface {
 	IncrementReservedInventory(ctx context.Context, arg IncrementReservedInventoryParams) (int64, error)
 	InsertBucketIfNotExists(ctx context.Context, arg InsertBucketIfNotExistsParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (OutboxEvent, error)
+	InvalidateHeldReservationsForEventBatch(ctx context.Context, arg InvalidateHeldReservationsForEventBatchParams) ([]InvalidateHeldReservationsForEventBatchRow, error)
 	ListActiveVenues(ctx context.Context) ([]Venue, error)
 	ListAllEventsByVenue(ctx context.Context, venueID pgtype.UUID) ([]Event, error)
 	ListOrganizerVenueBookings(ctx context.Context, organizerProfileID pgtype.UUID) ([]ListOrganizerVenueBookingsRow, error)

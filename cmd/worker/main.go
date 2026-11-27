@@ -13,6 +13,7 @@ import (
 	"github.com/Punith1117/ticket-forge/internal/config"
 	"github.com/Punith1117/ticket-forge/internal/database"
 	"github.com/Punith1117/ticket-forge/internal/email"
+	"github.com/Punith1117/ticket-forge/internal/event"
 	"github.com/Punith1117/ticket-forge/internal/outbox"
 	"github.com/Punith1117/ticket-forge/internal/payment"
 	"github.com/Punith1117/ticket-forge/internal/payment/simulator"
@@ -101,12 +102,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. Graceful Shutdown on OS Signal
+	// 6. Event Cancellation Worker
+	cancellationWorker, err := event.NewCancellationWorker(pool, repo, event.DefaultCancellationWorkerConfig(), logger)
+	if err != nil {
+		logger.Error("Failed to initialize cancellation worker", "error", err)
+		os.Exit(1)
+	}
+
+	// 7. Graceful Shutdown on OS Signal
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
@@ -119,6 +127,13 @@ func main() {
 		defer wg.Done()
 		if err := refundWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error("Refund worker run error", "error", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		if err := cancellationWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("Cancellation worker run error", "error", err)
 		}
 	}()
 

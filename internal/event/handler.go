@@ -47,6 +47,14 @@ func (h *Handler) RegisterRoutes(
 		"PATCH /api/v1/events/{id}/booking-status",
 		authHandler.RequireAuth(h.UpdateBookingStatus),
 	)
+	mux.HandleFunc(
+		"POST /api/v1/events/{id}/cancel",
+		authHandler.RequireAuth(h.CancelEvent),
+	)
+	mux.HandleFunc(
+		"GET /api/v1/events/{id}/cancellation-summary",
+		authHandler.RequireAuth(h.GetCancellationSummary),
+	)
 }
 
 func (h *Handler) getOrganizerProfileID(
@@ -274,6 +282,153 @@ func (h *Handler) UpdateBookingStatus(
 	}
 }
 
+func (h *Handler) CancelEvent(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		h.writeError(
+			w,
+			http.StatusUnauthorized,
+			"UNAUTHORIZED",
+			"Authentication required.",
+		)
+		return
+	}
+
+	organizerProfileID, ok := h.getOrganizerProfileID(
+		w,
+		r,
+		authUser.UserID,
+	)
+	if !ok {
+		return
+	}
+
+	eventID := r.PathValue("id")
+
+	var req CancelEventRequest
+	if r.Body != nil && r.ContentLength > 0 {
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			h.writeError(
+				w,
+				http.StatusBadRequest,
+				"INVALID_JSON",
+				"Invalid request body.",
+			)
+			return
+		}
+	}
+
+	idempotencyKey := r.Header.Get("Idempotency-Key")
+	if idempotencyKey == "" {
+		h.writeError(
+			w,
+			http.StatusBadRequest,
+			"IDEMPOTENCY_KEY_REQUIRED",
+			"Idempotency-Key header is required.",
+		)
+		return
+	}
+
+	response, err := h.service.Cancel(
+		r.Context(),
+		authUser.UserID,
+		organizerProfileID,
+		eventID,
+		idempotencyKey,
+		req,
+	)
+	if err != nil {
+		if h.handleServiceError(w, err) {
+			return
+		}
+
+		h.logger.Error("failed to cancel event",
+			"user_id", authUser.UserID,
+			"event_id", eventID,
+			"error", err,
+		)
+
+		h.writeError(
+			w,
+			http.StatusInternalServerError,
+			"INTERNAL_SERVER_ERROR",
+			"An unexpected error occurred.",
+		)
+		return
+	}
+
+	if err := httpresponse.WriteJSON(
+		w,
+		http.StatusOK,
+		response,
+	); err != nil {
+		h.logger.Error("failed to write cancel event response",
+			"error", err,
+		)
+	}
+}
+
+func (h *Handler) GetCancellationSummary(w http.ResponseWriter, r *http.Request) {
+	authUser, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		h.writeError(
+			w,
+			http.StatusUnauthorized,
+			"UNAUTHORIZED",
+			"Authentication required.",
+		)
+		return
+	}
+
+	organizerProfileID, ok := h.getOrganizerProfileID(
+		w,
+		r,
+		authUser.UserID,
+	)
+	if !ok {
+		return
+	}
+
+	eventID := r.PathValue("id")
+
+	response, err := h.service.GetCancellationSummary(
+		r.Context(),
+		organizerProfileID,
+		eventID,
+	)
+	if err != nil {
+		if h.handleServiceError(w, err) {
+			return
+		}
+
+		h.logger.Error("failed to get event cancellation summary",
+			"user_id", authUser.UserID,
+			"event_id", eventID,
+			"error", err,
+		)
+
+		h.writeError(
+			w,
+			http.StatusInternalServerError,
+			"INTERNAL_SERVER_ERROR",
+			"An unexpected error occurred.",
+		)
+		return
+	}
+
+	if err := httpresponse.WriteJSON(
+		w,
+		http.StatusOK,
+		response,
+	); err != nil {
+		h.logger.Error("failed to write cancellation summary response",
+			"error", err,
+		)
+	}
+}
+
 func (h *Handler) handleServiceError(
 	w http.ResponseWriter,
 	err error,
@@ -320,6 +475,11 @@ func (h *Handler) handleServiceError(
 		status = http.StatusConflict
 		code = "EVENT_NOT_ACTIVE"
 		message = "Cancelled events cannot be reopened."
+
+	case errors.Is(err, ErrEventAlreadyCancelled):
+		status = http.StatusConflict
+		code = "EVENT_ALREADY_CANCELLED"
+		message = "Event has already been cancelled."
 
 	case errors.Is(err, ErrInvalidBookingStatus):
 		status = http.StatusBadRequest

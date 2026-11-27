@@ -540,6 +540,65 @@ func (q *Queries) IncrementReservedInventory(ctx context.Context, arg IncrementR
 	return result.RowsAffected(), nil
 }
 
+const invalidateHeldReservationsForEventBatch = `-- name: InvalidateHeldReservationsForEventBatch :many
+WITH candidate_reservations AS (
+    SELECT r.id, r.ticket_category_id, r.quantity
+    FROM reservations r
+    JOIN ticket_categories tc ON tc.id = r.ticket_category_id
+    WHERE tc.event_id = $1
+      AND r.status = 'held'
+    ORDER BY r.id ASC
+    LIMIT $2
+    FOR UPDATE OF r SKIP LOCKED
+),
+cancelled_reservations AS (
+    UPDATE reservations r
+    SET
+        status = 'cancelled',
+        cancellation_reason = COALESCE($3, 'event_cancelled'),
+        updated_at = clock_timestamp()
+    FROM candidate_reservations cr
+    WHERE r.id = cr.id
+    RETURNING r.ticket_category_id, r.quantity
+)
+SELECT
+    ticket_category_id,
+    SUM(quantity)::integer AS released_quantity
+FROM cancelled_reservations
+GROUP BY ticket_category_id
+`
+
+type InvalidateHeldReservationsForEventBatchParams struct {
+	EventID            pgtype.UUID `db:"event_id" json:"event_id"`
+	LimitCount         int32       `db:"limit_count" json:"limit_count"`
+	CancellationReason pgtype.Text `db:"cancellation_reason" json:"cancellation_reason"`
+}
+
+type InvalidateHeldReservationsForEventBatchRow struct {
+	TicketCategoryID pgtype.UUID `db:"ticket_category_id" json:"ticket_category_id"`
+	ReleasedQuantity int32       `db:"released_quantity" json:"released_quantity"`
+}
+
+func (q *Queries) InvalidateHeldReservationsForEventBatch(ctx context.Context, arg InvalidateHeldReservationsForEventBatchParams) ([]InvalidateHeldReservationsForEventBatchRow, error) {
+	rows, err := q.db.Query(ctx, invalidateHeldReservationsForEventBatch, arg.EventID, arg.LimitCount, arg.CancellationReason)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []InvalidateHeldReservationsForEventBatchRow{}
+	for rows.Next() {
+		var i InvalidateHeldReservationsForEventBatchRow
+		if err := rows.Scan(&i.TicketCategoryID, &i.ReleasedQuantity); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockActiveTicketCategory = `-- name: LockActiveTicketCategory :one
 SELECT id, event_id, name, price_minor, currency, capacity, is_active
 FROM ticket_categories

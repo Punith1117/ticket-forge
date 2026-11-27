@@ -11,6 +11,40 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const cancelEvent = `-- name: CancelEvent :one
+UPDATE events
+SET
+    status = 'cancelled',
+    booking_status = 'paused',
+    updated_at = clock_timestamp()
+WHERE id = $1
+  AND organizer_profile_id = $2
+  AND status = 'active'
+RETURNING id, organizer_profile_id, title, description, status, booking_status, created_at, updated_at, venue_booking_id
+`
+
+type CancelEventParams struct {
+	ID                 pgtype.UUID `db:"id" json:"id"`
+	OrganizerProfileID pgtype.UUID `db:"organizer_profile_id" json:"organizer_profile_id"`
+}
+
+func (q *Queries) CancelEvent(ctx context.Context, arg CancelEventParams) (Event, error) {
+	row := q.db.QueryRow(ctx, cancelEvent, arg.ID, arg.OrganizerProfileID)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizerProfileID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.BookingStatus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.VenueBookingID,
+	)
+	return i, err
+}
+
 const createEvent = `-- name: CreateEvent :one
 INSERT INTO events (
     organizer_profile_id,
@@ -145,6 +179,98 @@ func (q *Queries) GetEventByID(ctx context.Context, id pgtype.UUID) (Event, erro
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.VenueBookingID,
+	)
+	return i, err
+}
+
+const getEventCancellationSummary = `-- name: GetEventCancellationSummary :one
+WITH event_scope AS (
+    SELECT id, status, booking_status
+    FROM events
+    WHERE events.id = $1
+      AND events.organizer_profile_id = $2
+),
+reservation_stats AS (
+    SELECT
+        COALESCE(COUNT(r.id) FILTER (WHERE r.status = 'cancelled'), 0)::bigint AS cancelled_reservations
+    FROM event_scope e
+    JOIN ticket_categories tc ON tc.event_id = e.id
+    JOIN reservations r ON r.ticket_category_id = tc.id
+),
+booking_stats AS (
+    SELECT
+        COALESCE(COUNT(b.id), 0)::bigint AS total_bookings,
+        COALESCE(COUNT(b.id) FILTER (WHERE b.status = 'cancelled'), 0)::bigint AS cancelled_bookings
+    FROM event_scope e
+    JOIN ticket_categories tc ON tc.event_id = e.id
+    JOIN reservations r ON r.ticket_category_id = tc.id
+    JOIN bookings b ON b.reservation_id = r.id
+),
+refund_stats AS (
+    SELECT
+        COALESCE(COUNT(rf.id) FILTER (WHERE rf.status = 'pending'), 0)::bigint AS refunds_pending,
+        COALESCE(COUNT(rf.id) FILTER (WHERE rf.status = 'processing'), 0)::bigint AS refunds_processing,
+        COALESCE(COUNT(rf.id) FILTER (WHERE rf.status = 'succeeded'), 0)::bigint AS refunds_succeeded,
+        COALESCE(COUNT(rf.id) FILTER (WHERE rf.status = 'failed'), 0)::bigint AS refunds_failed,
+        COALESCE(SUM(rf.amount_minor) FILTER (WHERE rf.status = 'succeeded'), 0)::bigint AS total_refunded_amount_minor
+    FROM event_scope e
+    JOIN ticket_categories tc ON tc.event_id = e.id
+    JOIN reservations r ON r.ticket_category_id = tc.id
+    JOIN payment_attempts pa ON pa.reservation_id = r.id
+    JOIN refunds rf ON rf.payment_attempt_id = pa.id
+)
+SELECT
+    e.id AS event_id,
+    e.status AS event_status,
+    e.booking_status,
+    COALESCE(bs.total_bookings, 0)::bigint AS total_bookings,
+    COALESCE(bs.cancelled_bookings, 0)::bigint AS cancelled_bookings,
+    COALESCE(rs.cancelled_reservations, 0)::bigint AS cancelled_reservations,
+    COALESCE(rfs.refunds_pending, 0)::bigint AS refunds_pending,
+    COALESCE(rfs.refunds_processing, 0)::bigint AS refunds_processing,
+    COALESCE(rfs.refunds_succeeded, 0)::bigint AS refunds_succeeded,
+    COALESCE(rfs.refunds_failed, 0)::bigint AS refunds_failed,
+    COALESCE(rfs.total_refunded_amount_minor, 0)::bigint AS total_refunded_amount_minor
+FROM event_scope e
+LEFT JOIN reservation_stats rs ON true
+LEFT JOIN booking_stats bs ON true
+LEFT JOIN refund_stats rfs ON true
+`
+
+type GetEventCancellationSummaryParams struct {
+	ID                 pgtype.UUID `db:"id" json:"id"`
+	OrganizerProfileID pgtype.UUID `db:"organizer_profile_id" json:"organizer_profile_id"`
+}
+
+type GetEventCancellationSummaryRow struct {
+	EventID                  pgtype.UUID `db:"event_id" json:"event_id"`
+	EventStatus              string      `db:"event_status" json:"event_status"`
+	BookingStatus            string      `db:"booking_status" json:"booking_status"`
+	TotalBookings            int64       `db:"total_bookings" json:"total_bookings"`
+	CancelledBookings        int64       `db:"cancelled_bookings" json:"cancelled_bookings"`
+	CancelledReservations    int64       `db:"cancelled_reservations" json:"cancelled_reservations"`
+	RefundsPending           int64       `db:"refunds_pending" json:"refunds_pending"`
+	RefundsProcessing        int64       `db:"refunds_processing" json:"refunds_processing"`
+	RefundsSucceeded         int64       `db:"refunds_succeeded" json:"refunds_succeeded"`
+	RefundsFailed            int64       `db:"refunds_failed" json:"refunds_failed"`
+	TotalRefundedAmountMinor int64       `db:"total_refunded_amount_minor" json:"total_refunded_amount_minor"`
+}
+
+func (q *Queries) GetEventCancellationSummary(ctx context.Context, arg GetEventCancellationSummaryParams) (GetEventCancellationSummaryRow, error) {
+	row := q.db.QueryRow(ctx, getEventCancellationSummary, arg.ID, arg.OrganizerProfileID)
+	var i GetEventCancellationSummaryRow
+	err := row.Scan(
+		&i.EventID,
+		&i.EventStatus,
+		&i.BookingStatus,
+		&i.TotalBookings,
+		&i.CancelledBookings,
+		&i.CancelledReservations,
+		&i.RefundsPending,
+		&i.RefundsProcessing,
+		&i.RefundsSucceeded,
+		&i.RefundsFailed,
+		&i.TotalRefundedAmountMinor,
 	)
 	return i, err
 }

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Punith1117/ticket-forge/internal/database/sqlc"
 	"github.com/Punith1117/ticket-forge/internal/idempotency"
@@ -18,11 +20,22 @@ import (
 
 const (
 	createEventOperation = "event.create"
+	cancelEventOperation = "event.cancel"
 
-	eventStatusActive   = "active"
-	bookingStatusOpen   = "open"
-	bookingStatusPaused = "paused"
+	eventStatusActive    = "active"
+	eventStatusCancelled = "cancelled"
+	bookingStatusOpen    = "open"
+	bookingStatusPaused  = "paused"
+
+	EventTypeEventCancellationRequested = "event.cancellation_requested"
 )
+
+type EventCancellationPayload struct {
+	EventID            string    `json:"event_id"`
+	OrganizerProfileID string    `json:"organizer_profile_id"`
+	Reason             string    `json:"reason"`
+	CancelledAt        time.Time `json:"cancelled_at"`
+}
 
 type Service struct {
 	pool        *pgxpool.Pool
@@ -391,6 +404,229 @@ func (s *Service) UpdateBookingStatus(
 	}
 
 	return response, nil
+}
+
+// Cancel transitions an active event to 'cancelled' and enqueues an outbox event.
+func (s *Service) Cancel(
+	ctx context.Context,
+	userID string,
+	organizerProfileID string,
+	eventID string,
+	idempotencyKey string,
+	req CancelEventRequest,
+) (CancelEventResponse, error) {
+	var response CancelEventResponse
+
+	parsedUserID, err := uuid.Parse(userID)
+	if err != nil {
+		return response, fmt.Errorf("event: invalid user ID: %w", err)
+	}
+
+	parsedOrganizerID, err := uuid.Parse(organizerProfileID)
+	if err != nil {
+		return response, fmt.Errorf("event: invalid organizer profile ID: %w", err)
+	}
+
+	parsedEventID, err := uuid.Parse(eventID)
+	if err != nil {
+		return response, ErrEventNotFound
+	}
+
+	organizerIDParam := pgtype.UUID{Bytes: parsedOrganizerID, Valid: true}
+	eventIDParam := pgtype.UUID{Bytes: parsedEventID, Valid: true}
+
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		reason = "organizer_cancelled"
+	}
+
+	payload, err := json.Marshal(struct {
+		EventID string `json:"event_id"`
+		Reason  string `json:"reason"`
+	}{
+		EventID: eventID,
+		Reason:  reason,
+	})
+	if err != nil {
+		return response, fmt.Errorf("event: failed to encode request: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return response, fmt.Errorf("event: failed to begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
+
+	execution, err := s.idempotency.Begin(ctx, tx, idempotency.Request{
+		UserID:    parsedUserID.String(),
+		Operation: cancelEventOperation,
+		Key:       idempotencyKey,
+		Payload:   payload,
+	})
+	if err != nil {
+		return response, fmt.Errorf("event: failed to begin idempotent operation: %w", err)
+	}
+
+	// Return the original response for a successful replay.
+	if execution.Replay != nil {
+		if err := json.Unmarshal(execution.Replay.Body, &response); err != nil {
+			return response, fmt.Errorf("event: failed to decode replay response: %w", err)
+		}
+
+		if err := tx.Rollback(ctx); err != nil {
+			return CancelEventResponse{}, fmt.Errorf(
+				"event: failed to close replay transaction: %w", err,
+			)
+		}
+
+		return response, nil
+	}
+
+	// Lock the event and verify ownership
+	lockedEvent, err := s.repository.LockActiveEventForOrganizer(
+		ctx,
+		tx,
+		eventIDParam,
+		organizerIDParam,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return response, ErrEventNotFound
+		}
+		return response, err
+	}
+
+	if lockedEvent.Status == eventStatusCancelled {
+		return response, ErrEventAlreadyCancelled
+	}
+	if lockedEvent.Status != eventStatusActive {
+		return response, ErrEventNotActive
+	}
+
+	cancelledEvent, err := s.repository.CancelEvent(
+		ctx,
+		tx,
+		sqlc.CancelEventParams{
+			ID:                 eventIDParam,
+			OrganizerProfileID: organizerIDParam,
+		},
+	)
+	if err != nil {
+		return response, err
+	}
+
+	// Enqueue outbox event for background processing
+	outboxPayload, err := json.Marshal(EventCancellationPayload{
+		EventID:            parsedEventID.String(),
+		OrganizerProfileID: parsedOrganizerID.String(),
+		Reason:             reason,
+		CancelledAt:        cancelledEvent.UpdatedAt.Time,
+	})
+	if err != nil {
+		return response, fmt.Errorf("event: failed to marshal cancellation payload: %w", err)
+	}
+
+	_, err = s.repository.InsertOutboxEvent(
+		ctx,
+		tx,
+		sqlc.InsertOutboxEventParams{
+			AggregateType: "event",
+			AggregateID:   eventIDParam,
+			EventType:     EventTypeEventCancellationRequested,
+			Payload:       outboxPayload,
+		},
+	)
+	if err != nil {
+		return response, fmt.Errorf("event: failed to enqueue cancellation outbox event: %w", err)
+	}
+
+	response = CancelEventResponse{
+		Message: "Event cancelled successfully",
+		Event: EventResponse{
+			ID:                 cancelledEvent.ID.String(),
+			OrganizerProfileID: cancelledEvent.OrganizerProfileID.String(),
+			VenueBookingID:     cancelledEvent.VenueBookingID.String(),
+			Title:              cancelledEvent.Title,
+			Description:        cancelledEvent.Description,
+			Status:             cancelledEvent.Status,
+			BookingStatus:      cancelledEvent.BookingStatus,
+			CreatedAt:          cancelledEvent.CreatedAt.Time,
+			UpdatedAt:          cancelledEvent.UpdatedAt.Time,
+		},
+	}
+
+	responseBody, err := json.Marshal(response)
+	if err != nil {
+		return CancelEventResponse{}, fmt.Errorf(
+			"event: failed to encode cancel response: %w", err,
+		)
+	}
+
+	if err := s.idempotency.Complete(
+		ctx,
+		tx,
+		execution,
+		http.StatusOK,
+		responseBody,
+	); err != nil {
+		return CancelEventResponse{}, fmt.Errorf(
+			"event: failed to complete idempotent operation: %w", err,
+		)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return CancelEventResponse{}, fmt.Errorf(
+			"event: failed to commit event cancellation: %w", err,
+		)
+	}
+
+	return response, nil
+}
+
+// GetCancellationSummary returns the current cancellation and refund progress for an event.
+func (s *Service) GetCancellationSummary(
+	ctx context.Context,
+	organizerProfileID string,
+	eventID string,
+) (EventCancellationSummaryResponse, error) {
+	var response EventCancellationSummaryResponse
+
+	parsedOrganizerID, err := uuid.Parse(organizerProfileID)
+	if err != nil {
+		return response, fmt.Errorf("event: invalid organizer profile ID: %w", err)
+	}
+
+	parsedEventID, err := uuid.Parse(eventID)
+	if err != nil {
+		return response, ErrEventNotFound
+	}
+
+	organizerIDParam := pgtype.UUID{Bytes: parsedOrganizerID, Valid: true}
+	eventIDParam := pgtype.UUID{Bytes: parsedEventID, Valid: true}
+
+	summary, err := s.repository.GetEventCancellationSummary(ctx, eventIDParam, organizerIDParam)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return response, ErrEventNotFound
+		}
+		return response, err
+	}
+
+	return EventCancellationSummaryResponse{
+		EventID:                  uuid.UUID(summary.EventID.Bytes).String(),
+		Status:                   summary.EventStatus,
+		BookingStatus:            summary.BookingStatus,
+		TotalBookings:            summary.TotalBookings,
+		CancelledBookings:        summary.CancelledBookings,
+		CancelledReservations:    summary.CancelledReservations,
+		RefundsPending:           summary.RefundsPending,
+		RefundsProcessing:        summary.RefundsProcessing,
+		RefundsSucceeded:         summary.RefundsSucceeded,
+		RefundsFailed:            summary.RefundsFailed,
+		TotalRefundedAmountMinor: summary.TotalRefundedAmountMinor,
+	}, nil
 }
 
 func validateCreateEventRequest(req *CreateEventRequest) error {

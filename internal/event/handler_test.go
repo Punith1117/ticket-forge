@@ -68,6 +68,12 @@ func TestHandleServiceError(t *testing.T) {
 			wantStatusCode: http.StatusConflict,
 		},
 		{
+			name:           "event already cancelled",
+			err:            ErrEventAlreadyCancelled,
+			wantHandled:    true,
+			wantStatusCode: http.StatusConflict,
+		},
+		{
 			name:           "invalid booking status",
 			err:            ErrInvalidBookingStatus,
 			wantHandled:    true,
