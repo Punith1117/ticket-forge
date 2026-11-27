@@ -11,10 +11,13 @@ import (
 )
 
 type Querier interface {
+	ActivatePaymentAttemptSession(ctx context.Context, arg ActivatePaymentAttemptSessionParams) (PaymentAttempt, error)
 	CancelVenueBooking(ctx context.Context, arg CancelVenueBookingParams) (CancelVenueBookingRow, error)
 	ClaimOutboxEvents(ctx context.Context, arg ClaimOutboxEventsParams) ([]OutboxEvent, error)
+	ClaimPendingRefunds(ctx context.Context, arg ClaimPendingRefundsParams) ([]Refund, error)
 	CompleteIdempotencyRecord(ctx context.Context, arg CompleteIdempotencyRecordParams) (IdempotencyRecord, error)
 	CompleteOutboxEvent(ctx context.Context, arg CompleteOutboxEventParams) (int64, error)
+	CompleteRefund(ctx context.Context, arg CompleteRefundParams) (int64, error)
 	// ============================================================
 	// RESERVATION CONFIRMATION & INVENTORY CONVERSION
 	// ============================================================
@@ -40,9 +43,6 @@ type Querier interface {
 	// WEBHOOK EVENTS
 	// ============================================================
 	CreatePaymentWebhookEvent(ctx context.Context, arg CreatePaymentWebhookEventParams) (PaymentWebhookEvent, error)
-	// ============================================================
-	// REFUNDS
-	// ============================================================
 	CreateRefund(ctx context.Context, arg CreateRefundParams) (Refund, error)
 	CreateRegistrationChallenge(ctx context.Context, arg CreateRegistrationChallengeParams) (RegistrationVerificationChallenge, error)
 	// Price is snapshotted from the category inside the database.
@@ -60,11 +60,16 @@ type Querier interface {
 	// Must be called after locking the associated event and ticket category.
 	// Returns the total quantity that must be released from inventory.
 	ExpireExpiredReservationsForCategory(ctx context.Context, ticketCategoryID pgtype.UUID) (int32, error)
+	ExpireInitializingPaymentAttempt(ctx context.Context, arg ExpireInitializingPaymentAttemptParams) (PaymentAttempt, error)
+	ExpirePaymentAttempt(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error)
 	// Only expires a reservation that is still held and past its deadline.
 	ExpireReservation(ctx context.Context, id pgtype.UUID) (int64, error)
+	FailInitializingPaymentAttempt(ctx context.Context, arg FailInitializingPaymentAttemptParams) (PaymentAttempt, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) (int64, error)
 	FailPaymentAttempt(ctx context.Context, arg FailPaymentAttemptParams) (PaymentAttempt, error)
+	FailRefund(ctx context.Context, arg FailRefundParams) (int64, error)
 	GetActiveEventByVenueBookingID(ctx context.Context, venueBookingID pgtype.UUID) (Event, error)
+	GetActivePaymentAttemptForReservation(ctx context.Context, reservationID pgtype.UUID) (PaymentAttempt, error)
 	GetActiveVenueForBooking(ctx context.Context, id pgtype.UUID) (GetActiveVenueForBookingRow, error)
 	GetBookingByID(ctx context.Context, id pgtype.UUID) (Booking, error)
 	GetBookingByReservationID(ctx context.Context, reservationID pgtype.UUID) (Booking, error)
@@ -83,9 +88,11 @@ type Querier interface {
 	GetPasswordResetTokenForUpdate(ctx context.Context, tokenHash string) (PasswordResetToken, error)
 	GetPaymentAttemptByID(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error)
 	GetPaymentAttemptByProviderOrder(ctx context.Context, arg GetPaymentAttemptByProviderOrderParams) (PaymentAttempt, error)
+	GetPaymentAttemptByProviderSession(ctx context.Context, arg GetPaymentAttemptByProviderSessionParams) (PaymentAttempt, error)
 	GetPaymentWebhookEvent(ctx context.Context, arg GetPaymentWebhookEventParams) (PaymentWebhookEvent, error)
 	GetRateLimitBucket(ctx context.Context, key string) (RateLimitBucket, error)
 	GetRateLimitBucketForUpdate(ctx context.Context, key string) (GetRateLimitBucketForUpdateRow, error)
+	GetRefundByID(ctx context.Context, id pgtype.UUID) (Refund, error)
 	GetRefundByPaymentAttemptID(ctx context.Context, paymentAttemptID pgtype.UUID) (Refund, error)
 	GetRegistrationChallengeForUpdate(ctx context.Context, tokenHash string) (RegistrationVerificationChallenge, error)
 	// ============================================================
@@ -132,15 +139,22 @@ type Querier interface {
 	// Capacity is already retrieved from the locked ticket category.
 	LockInventory(ctx context.Context, ticketCategoryID pgtype.UUID) (LockInventoryRow, error)
 	LockOrganizerProfile(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
+	LockPaymentAttemptByID(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error)
 	LockPaymentAttemptByProviderOrder(ctx context.Context, arg LockPaymentAttemptByProviderOrderParams) (PaymentAttempt, error)
 	LockPaymentWebhookEvent(ctx context.Context, arg LockPaymentWebhookEventParams) (PaymentWebhookEvent, error)
 	LockVenueBookingForOrganizer(ctx context.Context, arg LockVenueBookingForOrganizerParams) (LockVenueBookingForOrganizerRow, error)
+	ReclaimPaymentAttemptInitLease(ctx context.Context, arg ReclaimPaymentAttemptInitLeaseParams) (PaymentAttempt, error)
+	RetryFailedRefund(ctx context.Context, id pgtype.UUID) (Refund, error)
 	RetryOutboxEvent(ctx context.Context, arg RetryOutboxEventParams) (int64, error)
+	RetryRefund(ctx context.Context, arg RetryRefundParams) (int64, error)
 	RevokeAllSessionsByUserID(ctx context.Context, userID pgtype.UUID) (int64, error)
 	RevokeSessionByID(ctx context.Context, id pgtype.UUID) (int64, error)
 	SucceedPaymentAttempt(ctx context.Context, arg SucceedPaymentAttemptParams) (PaymentAttempt, error)
+	// ============================================================
+	// REFUNDS
+	// ============================================================
+	SumActiveRefundsForAttempt(ctx context.Context, paymentAttemptID pgtype.UUID) (int64, error)
 	UpdateActiveEventBookingStatus(ctx context.Context, arg UpdateActiveEventBookingStatusParams) (Event, error)
-	UpdatePaymentAttemptProviderOrder(ctx context.Context, arg UpdatePaymentAttemptProviderOrderParams) (PaymentAttempt, error)
 	UpdatePaymentWebhookEventStatus(ctx context.Context, arg UpdatePaymentWebhookEventStatusParams) (PaymentWebhookEvent, error)
 	UpdateRateLimitBucket(ctx context.Context, arg UpdateRateLimitBucketParams) (int64, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error)

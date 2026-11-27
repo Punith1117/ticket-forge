@@ -380,35 +380,51 @@ func TestUniqueReservationToBookingRelationship(t *testing.T) {
 		t.Fatalf("failed to insert first payment attempt: %v", err)
 	}
 
-	// First refund succeeds
+	// First refund succeeds (partial refund)
 	_, err = pool.Exec(ctx, `
-		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status)
-		VALUES ($1, $2, 10000, 'INR', 'pending')
+		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status, idempotency_key)
+		VALUES ($1, $2, 5000, 'INR', 'pending', 'partial_1')
 	`, bookingID, firstPaymentAttemptID)
 	if err != nil {
 		t.Fatalf("failed to insert first refund: %v", err)
 	}
 
-	// Create a separate payment attempt for the second refund
-	var secondPaymentAttemptID string
-	err = pool.QueryRow(ctx, `
-		INSERT INTO payment_attempts (
-			reservation_id, provider, amount_minor, currency, status
-		)
-		VALUES ($1, 'test', 10000, 'INR', 'succeeded')
-		RETURNING id::text
-	`, resID).Scan(&secondPaymentAttemptID)
+	// Second partial refund on same payment attempt & booking succeeds
+	_, err = pool.Exec(ctx, `
+		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status, idempotency_key)
+		VALUES ($1, $2, 5000, 'INR', 'pending', 'partial_2')
+	`, bookingID, firstPaymentAttemptID)
 	if err != nil {
-		t.Fatalf("failed to insert second payment attempt: %v", err)
+		t.Fatalf("failed to insert second partial refund: %v", err)
 	}
 
-	// Second refund for same booking MUST FAIL (unique constraint)
+	// Duplicate refund with the same non-empty idempotency_key on the same payment attempt MUST FAIL (23505)
 	_, err = pool.Exec(ctx, `
-		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status)
-		VALUES ($1, $2, 10000, 'INR', 'pending')
-	`, bookingID, secondPaymentAttemptID)
+		INSERT INTO refunds (booking_id, payment_attempt_id, amount_minor, currency, status, idempotency_key)
+		VALUES ($1, $2, 5000, 'INR', 'pending', 'partial_1')
+	`, bookingID, firstPaymentAttemptID)
 	if err == nil {
-		t.Fatal("expected unique violation for second refund on same booking, but succeeded")
+		t.Fatal("expected unique violation for duplicate refund idempotency_key, but succeeded")
+	}
+	pgErr, ok = err.(*pgconn.PgError)
+	if !ok || pgErr.Code != "23505" {
+		t.Fatalf("expected unique_violation (23505), got: %v", err)
+	}
+
+	// Only one active (initializing or pending) payment attempt is allowed per reservation
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_attempts (reservation_id, provider, amount_minor, currency, status)
+		VALUES ($1, 'test', 10000, 'INR', 'pending')
+	`, resID)
+	if err != nil {
+		t.Fatalf("failed to insert active pending payment attempt: %v", err)
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO payment_attempts (reservation_id, provider, amount_minor, currency, status)
+		VALUES ($1, 'test', 10000, 'INR', 'pending')
+	`, resID)
+	if err == nil {
+		t.Fatal("expected unique violation for second active payment attempt on same reservation, but succeeded")
 	}
 	pgErr, ok = err.(*pgconn.PgError)
 	if !ok || pgErr.Code != "23505" {

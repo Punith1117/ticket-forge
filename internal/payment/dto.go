@@ -13,4 +13,5 @@ type CheckoutSessionResponse struct {
 	Currency             string    `json:"currency"`
 	Status               string    `json:"status"`
 	ReservationExpiresAt time.Time `json:"reservation_expires_at"`
+	Reused               bool      `json:"-"`
 }

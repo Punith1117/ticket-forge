@@ -16,6 +16,7 @@ const createBooking = `-- name: CreateBooking :one
 INSERT INTO bookings (
     id,
     reservation_id,
+    payment_attempt_id,
     customer_id,
     quantity,
     unit_price_minor,
@@ -31,20 +32,22 @@ INSERT INTO bookings (
     $5,
     $6,
     $7,
+    $8,
     'confirmed',
     clock_timestamp()
 )
-RETURNING id, reservation_id, customer_id, quantity, unit_price_minor, total_price_minor, currency, status, confirmed_at, created_at
+RETURNING id, reservation_id, customer_id, quantity, unit_price_minor, total_price_minor, currency, status, confirmed_at, created_at, payment_attempt_id
 `
 
 type CreateBookingParams struct {
-	ID              pgtype.UUID `db:"id" json:"id"`
-	ReservationID   pgtype.UUID `db:"reservation_id" json:"reservation_id"`
-	CustomerID      pgtype.UUID `db:"customer_id" json:"customer_id"`
-	Quantity        int32       `db:"quantity" json:"quantity"`
-	UnitPriceMinor  int64       `db:"unit_price_minor" json:"unit_price_minor"`
-	TotalPriceMinor int64       `db:"total_price_minor" json:"total_price_minor"`
-	Currency        string      `db:"currency" json:"currency"`
+	ID               pgtype.UUID `db:"id" json:"id"`
+	ReservationID    pgtype.UUID `db:"reservation_id" json:"reservation_id"`
+	PaymentAttemptID pgtype.UUID `db:"payment_attempt_id" json:"payment_attempt_id"`
+	CustomerID       pgtype.UUID `db:"customer_id" json:"customer_id"`
+	Quantity         int32       `db:"quantity" json:"quantity"`
+	UnitPriceMinor   int64       `db:"unit_price_minor" json:"unit_price_minor"`
+	TotalPriceMinor  int64       `db:"total_price_minor" json:"total_price_minor"`
+	Currency         string      `db:"currency" json:"currency"`
 }
 
 // ============================================================
@@ -54,6 +57,7 @@ func (q *Queries) CreateBooking(ctx context.Context, arg CreateBookingParams) (B
 	row := q.db.QueryRow(ctx, createBooking,
 		arg.ID,
 		arg.ReservationID,
+		arg.PaymentAttemptID,
 		arg.CustomerID,
 		arg.Quantity,
 		arg.UnitPriceMinor,
@@ -72,12 +76,13 @@ func (q *Queries) CreateBooking(ctx context.Context, arg CreateBookingParams) (B
 		&i.Status,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.PaymentAttemptID,
 	)
 	return i, err
 }
 
 const getBookingByID = `-- name: GetBookingByID :one
-SELECT id, reservation_id, customer_id, quantity, unit_price_minor, total_price_minor, currency, status, confirmed_at, created_at
+SELECT id, reservation_id, customer_id, quantity, unit_price_minor, total_price_minor, currency, status, confirmed_at, created_at, payment_attempt_id
 FROM bookings
 WHERE id = $1
 LIMIT 1
@@ -97,12 +102,13 @@ func (q *Queries) GetBookingByID(ctx context.Context, id pgtype.UUID) (Booking, 
 		&i.Status,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.PaymentAttemptID,
 	)
 	return i, err
 }
 
 const getBookingByReservationID = `-- name: GetBookingByReservationID :one
-SELECT id, reservation_id, customer_id, quantity, unit_price_minor, total_price_minor, currency, status, confirmed_at, created_at
+SELECT id, reservation_id, customer_id, quantity, unit_price_minor, total_price_minor, currency, status, confirmed_at, created_at, payment_attempt_id
 FROM bookings
 WHERE reservation_id = $1
 LIMIT 1
@@ -122,6 +128,7 @@ func (q *Queries) GetBookingByReservationID(ctx context.Context, reservationID p
 		&i.Status,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.PaymentAttemptID,
 	)
 	return i, err
 }

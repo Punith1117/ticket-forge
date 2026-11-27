@@ -38,7 +38,9 @@ type Provider struct {
 	client             *Client
 	tolerance          time.Duration
 	sessions           *SessionStore
+	sessionLookup      SessionLookup
 	reservationChecker ReservationChecker
+	refundHook         func(ctx context.Context, req payment.RefundRequest) (payment.RefundResult, error)
 }
 
 func NewProvider(secret string, webhookURL string, client *Client) (*Provider, error) {
@@ -89,32 +91,58 @@ func (p *Provider) SetReservationChecker(checker ReservationChecker) {
 	p.reservationChecker = checker
 }
 
+func (p *Provider) SetSessionLookup(lookup SessionLookup) {
+	p.sessionLookup = lookup
+}
+
+func (p *Provider) SetRefundHook(hook func(ctx context.Context, req payment.RefundRequest) (payment.RefundResult, error)) {
+	p.refundHook = hook
+}
+
 func (p *Provider) Sessions() *SessionStore {
 	return p.sessions
 }
 
-// CreateCheckoutSession creates a unique simulated checkout session and records it for the hosted page.
+// CreateCheckoutSession creates a unique simulated checkout session (idempotent by PaymentAttemptID) and records it for the hosted page.
 func (p *Provider) CreateCheckoutSession(
 	ctx context.Context,
 	req payment.CreateCheckoutSessionRequest,
 ) (payment.CheckoutSession, error) {
+	if p.sessionLookup != nil && req.PaymentAttemptID != "" {
+		if existing, err := p.sessionLookup.GetSessionByAttemptID(ctx, req.PaymentAttemptID); err == nil && existing.SessionID != "" {
+			return payment.CheckoutSession{
+				ProviderSessionID:      existing.SessionID,
+				ProviderOrderReference: existing.OrderRef,
+				CheckoutURL:            p.checkoutURL(existing.SessionID),
+				ExpiresAt:              existing.ExpiresAt,
+			}, nil
+		}
+	}
+
+	if req.PaymentAttemptID != "" {
+		if existing, ok := p.sessions.GetByAttemptID(req.PaymentAttemptID); ok {
+			return payment.CheckoutSession{
+				ProviderSessionID:      existing.SessionID,
+				ProviderOrderReference: existing.OrderRef,
+				CheckoutURL:            p.checkoutURL(existing.SessionID),
+				ExpiresAt:              existing.ExpiresAt,
+			}, nil
+		}
+	}
+
 	sessionID := "sim_sess_" + uuid.New().String()
 	orderRef := "sim_ord_" + uuid.New().String()
-
-	checkoutURL := fmt.Sprintf(
-		"%s/api/v1/checkout?session_id=%s",
-		p.baseURL,
-		sessionID,
-	)
+	checkoutURL := p.checkoutURL(sessionID)
 
 	// Persist session record within simulated provider boundary
 	p.sessions.Save(&SessionRecord{
-		SessionID:     sessionID,
-		OrderRef:      orderRef,
-		ReservationID: req.ReservationID,
-		AmountMinor:   req.AmountMinor,
-		Currency:      req.Currency,
-		ExpiresAt:     req.ExpiresAt,
+		PaymentAttemptID: req.PaymentAttemptID,
+		SessionID:        sessionID,
+		OrderRef:         orderRef,
+		ReservationID:    req.ReservationID,
+		AmountMinor:      req.AmountMinor,
+		Currency:         req.Currency,
+		ExpiresAt:        req.ExpiresAt,
 	})
 
 	return payment.CheckoutSession{
@@ -122,6 +150,24 @@ func (p *Provider) CreateCheckoutSession(
 		ProviderOrderReference: orderRef,
 		CheckoutURL:            checkoutURL,
 		ExpiresAt:              req.ExpiresAt,
+	}, nil
+}
+
+func (p *Provider) checkoutURL(sessionID string) string {
+	return fmt.Sprintf(
+		"%s/api/v1/checkout?session_id=%s",
+		p.baseURL,
+		sessionID,
+	)
+}
+
+// Refund executes a simulated refund idempotently by RefundID.
+func (p *Provider) Refund(ctx context.Context, req payment.RefundRequest) (payment.RefundResult, error) {
+	if p.refundHook != nil {
+		return p.refundHook(ctx, req)
+	}
+	return payment.RefundResult{
+		ProviderRefundReference: "sim_ref_" + req.RefundID,
 	}, nil
 }
 

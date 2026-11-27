@@ -400,6 +400,7 @@ func (s *Service) ConfirmReservationPayment(
 	createdBooking, err := s.repository.CreateBooking(ctx, tx, sqlc.CreateBookingParams{
 		ID:               pgtype.UUID{Bytes: bookingID, Valid: true},
 		ReservationID:    res.ID,
+		PaymentAttemptID: attemptDBID,
 		CustomerID:       res.CustomerID,
 		Quantity:         res.Quantity,
 		UnitPriceMinor:   res.UnitPriceMinor,
@@ -597,9 +598,9 @@ func deriveReservationOutcome(
 		}
 	}
 
-	// 3. No succeeded payment (unpaid, pending, or failed).
+	// 3. No succeeded payment (unpaid, initializing, pending, failed, or expired).
 	switch paymentStatus {
-	case "", "pending", "failed":
+	case "", "initializing", "pending", "failed", "expired":
 	default:
 		return "", false, fmt.Errorf(
 			"%w: unknown payment_status=%s",

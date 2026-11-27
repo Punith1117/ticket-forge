@@ -54,8 +54,19 @@ func TestSimulator_CreateCheckoutSession(t *testing.T) {
 		t.Errorf("expected expiration %v, got %v", exp, s1.ExpiresAt)
 	}
 
-	// Multiple sessions generate unique references
-	s2, err := prov.CreateCheckoutSession(context.Background(), req1)
+	// Same PaymentAttemptID is idempotent and returns the same session
+	sSame, err := prov.CreateCheckoutSession(context.Background(), req1)
+	if err != nil {
+		t.Fatalf("unexpected error on idempotent session: %v", err)
+	}
+	if sSame.ProviderSessionID != s1.ProviderSessionID || sSame.ProviderOrderReference != s1.ProviderOrderReference {
+		t.Errorf("expected identical session for same PaymentAttemptID, got %s vs %s", sSame.ProviderSessionID, s1.ProviderSessionID)
+	}
+
+	// Different PaymentAttemptID generates unique references
+	req2 := req1
+	req2.PaymentAttemptID = "attempt-2"
+	s2, err := prov.CreateCheckoutSession(context.Background(), req2)
 	if err != nil {
 		t.Fatalf("unexpected error on second session: %v", err)
 	}
@@ -389,7 +400,7 @@ func TestSimulator_OutcomeSubmission(t *testing.T) {
 		}
 	})
 
-	t.Run("Reservation no longer held rejected with 409", func(t *testing.T) {
+	t.Run("Already completed session rejected with 409", func(t *testing.T) {
 		sess3, _ := prov.CreateCheckoutSession(context.Background(), payment.CreateCheckoutSessionRequest{
 			PaymentAttemptID: "p-sub-3",
 			ReservationID:    "r-sub-3",
@@ -398,22 +409,22 @@ func TestSimulator_OutcomeSubmission(t *testing.T) {
 			ExpiresAt:        exp,
 		})
 
-		checker.statusFunc = func(ctx context.Context, reservationID string) (simulator.ReservationStatus, error) {
-			return simulator.ReservationStatus{
-				Status:    "cancelled",
-				ExpiresAt: time.Now().Add(2 * time.Minute),
-			}, nil
+		reqBody := []byte(`{"outcome":"succeeded"}`)
+		req1 := httptest.NewRequest(http.MethodPost, "/api/v1/checkout/"+sess3.ProviderSessionID+"/complete", bytes.NewReader(reqBody))
+		req1.Header.Set("Content-Type", "application/json")
+		rec1 := httptest.NewRecorder()
+		mux.ServeHTTP(rec1, req1)
+		if rec1.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK on first completion, got %d", rec1.Code)
 		}
 
-		reqBody := []byte(`{"outcome":"succeeded"}`)
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/checkout/"+sess3.ProviderSessionID+"/complete", bytes.NewReader(reqBody))
-		req.Header.Set("Content-Type", "application/json")
+		req2 := httptest.NewRequest(http.MethodPost, "/api/v1/checkout/"+sess3.ProviderSessionID+"/complete", bytes.NewReader(reqBody))
+		req2.Header.Set("Content-Type", "application/json")
+		rec2 := httptest.NewRecorder()
+		mux.ServeHTTP(rec2, req2)
 
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusConflict {
-			t.Errorf("expected 409 Conflict when reservation is not held, got %d", rec.Code)
+		if rec2.Code != http.StatusConflict {
+			t.Errorf("expected 409 Conflict when session already completed, got %d", rec2.Code)
 		}
 	})
 }

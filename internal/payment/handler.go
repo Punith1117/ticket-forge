@@ -69,7 +69,12 @@ func (h *Handler) CreateCheckoutSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err := httpresponse.WriteJSON(w, http.StatusCreated, resp); err != nil {
+	statusCode := http.StatusCreated
+	if resp.Reused {
+		statusCode = http.StatusOK
+	}
+
+	if err := httpresponse.WriteJSON(w, statusCode, resp); err != nil {
 		h.logger.Error("failed to write create checkout session response",
 			"error", err,
 		)
@@ -130,6 +135,10 @@ func (h *Handler) handleCheckoutError(w http.ResponseWriter, err error) bool {
 		status = http.StatusBadRequest
 		code = "FREE_RESERVATION_NOT_SUPPORTED"
 		message = "Free reservations cannot use payment checkout."
+	case errors.Is(err, ErrCheckoutInProgress):
+		status = http.StatusConflict
+		code = "CHECKOUT_IN_PROGRESS"
+		message = "Checkout session initialization is already in progress."
 	case errors.Is(err, ErrProviderSessionFailed):
 		status = http.StatusBadGateway
 		code = "PROVIDER_SESSION_FAILED"

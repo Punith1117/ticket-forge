@@ -11,51 +11,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createPaymentAttempt = `-- name: CreatePaymentAttempt :one
-
-INSERT INTO payment_attempts (
-    id,
-    reservation_id,
-    amount_minor,
-    currency,
-    status,
-    provider,
-    provider_order_reference,
-    attempted_at
-)
-VALUES (
-    $1,
-    $2,
-    $3,
-    $4,
-    'pending',
-    $5,
-    $6,
-    clock_timestamp()
-)
-RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+const activatePaymentAttemptSession = `-- name: ActivatePaymentAttemptSession :one
+UPDATE payment_attempts
+SET
+    status = 'pending',
+    provider_checkout_session_id = $1,
+    provider_order_reference = $2,
+    checkout_url = $3,
+    expires_at = $4,
+    init_claim_token = NULL,
+    init_lease_expires_at = NULL
+WHERE id = $5
+  AND status = 'initializing'
+  AND init_claim_token = $6
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
 `
 
-type CreatePaymentAttemptParams struct {
-	ID                     pgtype.UUID `db:"id" json:"id"`
-	ReservationID          pgtype.UUID `db:"reservation_id" json:"reservation_id"`
-	AmountMinor            int64       `db:"amount_minor" json:"amount_minor"`
-	Currency               string      `db:"currency" json:"currency"`
-	Provider               string      `db:"provider" json:"provider"`
-	ProviderOrderReference pgtype.Text `db:"provider_order_reference" json:"provider_order_reference"`
+type ActivatePaymentAttemptSessionParams struct {
+	ProviderCheckoutSessionID pgtype.Text        `db:"provider_checkout_session_id" json:"provider_checkout_session_id"`
+	ProviderOrderReference    pgtype.Text        `db:"provider_order_reference" json:"provider_order_reference"`
+	CheckoutUrl               pgtype.Text        `db:"checkout_url" json:"checkout_url"`
+	ExpiresAt                 pgtype.Timestamptz `db:"expires_at" json:"expires_at"`
+	ID                        pgtype.UUID        `db:"id" json:"id"`
+	InitClaimToken            pgtype.UUID        `db:"init_claim_token" json:"init_claim_token"`
 }
 
-// ============================================================
-// PAYMENT ATTEMPTS
-// ============================================================
-func (q *Queries) CreatePaymentAttempt(ctx context.Context, arg CreatePaymentAttemptParams) (PaymentAttempt, error) {
-	row := q.db.QueryRow(ctx, createPaymentAttempt,
-		arg.ID,
-		arg.ReservationID,
-		arg.AmountMinor,
-		arg.Currency,
-		arg.Provider,
+func (q *Queries) ActivatePaymentAttemptSession(ctx context.Context, arg ActivatePaymentAttemptSessionParams) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, activatePaymentAttemptSession,
+		arg.ProviderCheckoutSessionID,
 		arg.ProviderOrderReference,
+		arg.CheckoutUrl,
+		arg.ExpiresAt,
+		arg.ID,
+		arg.InitClaimToken,
 	)
 	var i PaymentAttempt
 	err := row.Scan(
@@ -70,6 +58,178 @@ func (q *Queries) CreatePaymentAttempt(ctx context.Context, arg CreatePaymentAtt
 		&i.CompletedAt,
 		&i.Provider,
 		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
+	)
+	return i, err
+}
+
+const claimPendingRefunds = `-- name: ClaimPendingRefunds :many
+WITH eligible AS (
+    SELECT id
+    FROM refunds
+    WHERE (
+        (status = 'pending' AND next_attempt_at <= clock_timestamp())
+        OR
+        (status = 'processing' AND claim_expires_at <= clock_timestamp())
+    )
+    ORDER BY next_attempt_at ASC, created_at ASC
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE refunds
+SET
+    status = 'processing',
+    claim_token = uuidv7(),
+    claim_expires_at = clock_timestamp() + $1::interval
+FROM eligible
+WHERE refunds.id = eligible.id
+RETURNING refunds.id, refunds.booking_id, refunds.amount_minor, refunds.currency, refunds.status, refunds.failure_reason, refunds.created_at, refunds.completed_at, refunds.payment_attempt_id, refunds.provider_refund_reference, refunds.attempts, refunds.next_attempt_at, refunds.claim_token, refunds.claim_expires_at, refunds.last_attempt_at, refunds.last_error, refunds.idempotency_key
+`
+
+type ClaimPendingRefundsParams struct {
+	LeaseDuration pgtype.Interval `db:"lease_duration" json:"lease_duration"`
+	LimitCount    int32           `db:"limit_count" json:"limit_count"`
+}
+
+func (q *Queries) ClaimPendingRefunds(ctx context.Context, arg ClaimPendingRefundsParams) ([]Refund, error) {
+	rows, err := q.db.Query(ctx, claimPendingRefunds, arg.LeaseDuration, arg.LimitCount)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Refund{}
+	for rows.Next() {
+		var i Refund
+		if err := rows.Scan(
+			&i.ID,
+			&i.BookingID,
+			&i.AmountMinor,
+			&i.Currency,
+			&i.Status,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.CompletedAt,
+			&i.PaymentAttemptID,
+			&i.ProviderRefundReference,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.ClaimToken,
+			&i.ClaimExpiresAt,
+			&i.LastAttemptAt,
+			&i.LastError,
+			&i.IdempotencyKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const completeRefund = `-- name: CompleteRefund :execrows
+UPDATE refunds
+SET
+    status = 'succeeded',
+    provider_refund_reference = $1,
+    completed_at = clock_timestamp(),
+    last_attempt_at = clock_timestamp(),
+    last_error = NULL,
+    claim_token = NULL,
+    claim_expires_at = NULL
+WHERE id = $2
+  AND status = 'processing'
+  AND claim_token = $3
+`
+
+type CompleteRefundParams struct {
+	ProviderRefundReference pgtype.Text `db:"provider_refund_reference" json:"provider_refund_reference"`
+	ID                      pgtype.UUID `db:"id" json:"id"`
+	ClaimToken              pgtype.UUID `db:"claim_token" json:"claim_token"`
+}
+
+func (q *Queries) CompleteRefund(ctx context.Context, arg CompleteRefundParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeRefund, arg.ProviderRefundReference, arg.ID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const createPaymentAttempt = `-- name: CreatePaymentAttempt :one
+
+INSERT INTO payment_attempts (
+    id,
+    reservation_id,
+    amount_minor,
+    currency,
+    status,
+    provider,
+    init_claim_token,
+    init_lease_expires_at,
+    attempted_at
+)
+VALUES (
+    $1,
+    $2,
+    $3,
+    $4,
+    'initializing',
+    $5,
+    $6,
+    clock_timestamp() + $7::interval,
+    clock_timestamp()
+)
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+`
+
+type CreatePaymentAttemptParams struct {
+	ID             pgtype.UUID     `db:"id" json:"id"`
+	ReservationID  pgtype.UUID     `db:"reservation_id" json:"reservation_id"`
+	AmountMinor    int64           `db:"amount_minor" json:"amount_minor"`
+	Currency       string          `db:"currency" json:"currency"`
+	Provider       string          `db:"provider" json:"provider"`
+	InitClaimToken pgtype.UUID     `db:"init_claim_token" json:"init_claim_token"`
+	LeaseDuration  pgtype.Interval `db:"lease_duration" json:"lease_duration"`
+}
+
+// ============================================================
+// PAYMENT ATTEMPTS
+// ============================================================
+func (q *Queries) CreatePaymentAttempt(ctx context.Context, arg CreatePaymentAttemptParams) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, createPaymentAttempt,
+		arg.ID,
+		arg.ReservationID,
+		arg.AmountMinor,
+		arg.Currency,
+		arg.Provider,
+		arg.InitClaimToken,
+		arg.LeaseDuration,
+	)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
@@ -97,7 +257,7 @@ VALUES (
     $7,
     clock_timestamp(),
     CASE
-        WHEN $7 = 'processed' THEN clock_timestamp()
+        WHEN $7 IN ('processed', 'ignored') THEN clock_timestamp()
         ELSE NULL
     END
 )
@@ -144,24 +304,25 @@ func (q *Queries) CreatePaymentWebhookEvent(ctx context.Context, arg CreatePayme
 }
 
 const createRefund = `-- name: CreateRefund :one
-
 INSERT INTO refunds (
     id,
     payment_attempt_id,
     booking_id,
     amount_minor,
     currency,
-    status
+    status,
+    idempotency_key
 ) VALUES (
     $1,
     $2,
     $3,
     $4,
     $5,
-    'pending'
+    'pending',
+    $6
 )
-ON CONFLICT (payment_attempt_id) DO NOTHING
-RETURNING id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error
+ON CONFLICT (payment_attempt_id, idempotency_key) WHERE idempotency_key <> '' DO NOTHING
+RETURNING id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error, idempotency_key
 `
 
 type CreateRefundParams struct {
@@ -170,11 +331,9 @@ type CreateRefundParams struct {
 	BookingID        pgtype.UUID `db:"booking_id" json:"booking_id"`
 	AmountMinor      int64       `db:"amount_minor" json:"amount_minor"`
 	Currency         string      `db:"currency" json:"currency"`
+	IdempotencyKey   string      `db:"idempotency_key" json:"idempotency_key"`
 }
 
-// ============================================================
-// REFUNDS
-// ============================================================
 func (q *Queries) CreateRefund(ctx context.Context, arg CreateRefundParams) (Refund, error) {
 	row := q.db.QueryRow(ctx, createRefund,
 		arg.ID,
@@ -182,6 +341,7 @@ func (q *Queries) CreateRefund(ctx context.Context, arg CreateRefundParams) (Ref
 		arg.BookingID,
 		arg.AmountMinor,
 		arg.Currency,
+		arg.IdempotencyKey,
 	)
 	var i Refund
 	err := row.Scan(
@@ -201,6 +361,127 @@ func (q *Queries) CreateRefund(ctx context.Context, arg CreateRefundParams) (Ref
 		&i.ClaimExpiresAt,
 		&i.LastAttemptAt,
 		&i.LastError,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
+const expireInitializingPaymentAttempt = `-- name: ExpireInitializingPaymentAttempt :one
+UPDATE payment_attempts
+SET
+    status = 'expired',
+    completed_at = clock_timestamp(),
+    init_claim_token = NULL,
+    init_lease_expires_at = NULL
+WHERE id = $1
+  AND status = 'initializing'
+  AND init_claim_token = $2
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+`
+
+type ExpireInitializingPaymentAttemptParams struct {
+	ID             pgtype.UUID `db:"id" json:"id"`
+	InitClaimToken pgtype.UUID `db:"init_claim_token" json:"init_claim_token"`
+}
+
+func (q *Queries) ExpireInitializingPaymentAttempt(ctx context.Context, arg ExpireInitializingPaymentAttemptParams) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, expireInitializingPaymentAttempt, arg.ID, arg.InitClaimToken)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
+	)
+	return i, err
+}
+
+const expirePaymentAttempt = `-- name: ExpirePaymentAttempt :one
+UPDATE payment_attempts
+SET
+    status = 'expired',
+    completed_at = clock_timestamp()
+WHERE id = $1
+  AND status = 'pending'
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+`
+
+func (q *Queries) ExpirePaymentAttempt(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, expirePaymentAttempt, id)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
+	)
+	return i, err
+}
+
+const failInitializingPaymentAttempt = `-- name: FailInitializingPaymentAttempt :one
+UPDATE payment_attempts
+SET
+    status = 'failed',
+    failure_reason = $1,
+    completed_at = clock_timestamp(),
+    init_claim_token = NULL,
+    init_lease_expires_at = NULL
+WHERE id = $2
+  AND status = 'initializing'
+  AND init_claim_token = $3
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+`
+
+type FailInitializingPaymentAttemptParams struct {
+	FailureReason  pgtype.Text `db:"failure_reason" json:"failure_reason"`
+	ID             pgtype.UUID `db:"id" json:"id"`
+	InitClaimToken pgtype.UUID `db:"init_claim_token" json:"init_claim_token"`
+}
+
+func (q *Queries) FailInitializingPaymentAttempt(ctx context.Context, arg FailInitializingPaymentAttemptParams) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, failInitializingPaymentAttempt, arg.FailureReason, arg.ID, arg.InitClaimToken)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
@@ -213,7 +494,7 @@ SET
     completed_at = clock_timestamp()
 WHERE id = $2
   AND status = 'pending'
-RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
 `
 
 type FailPaymentAttemptParams struct {
@@ -236,12 +517,86 @@ func (q *Queries) FailPaymentAttempt(ctx context.Context, arg FailPaymentAttempt
 		&i.CompletedAt,
 		&i.Provider,
 		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
+	)
+	return i, err
+}
+
+const failRefund = `-- name: FailRefund :execrows
+UPDATE refunds
+SET
+    status = 'failed',
+    failure_reason = $1,
+    attempts = CASE WHEN $2::boolean THEN attempts + 1 ELSE attempts END,
+    last_attempt_at = CASE WHEN $2::boolean THEN clock_timestamp() ELSE last_attempt_at END,
+    last_error = $3,
+    claim_token = NULL,
+    claim_expires_at = NULL
+WHERE id = $4
+  AND status = 'processing'
+  AND claim_token = $5
+`
+
+type FailRefundParams struct {
+	FailureReason     pgtype.Text `db:"failure_reason" json:"failure_reason"`
+	DeliveryAttempted bool        `db:"delivery_attempted" json:"delivery_attempted"`
+	LastError         pgtype.Text `db:"last_error" json:"last_error"`
+	ID                pgtype.UUID `db:"id" json:"id"`
+	ClaimToken        pgtype.UUID `db:"claim_token" json:"claim_token"`
+}
+
+func (q *Queries) FailRefund(ctx context.Context, arg FailRefundParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failRefund,
+		arg.FailureReason,
+		arg.DeliveryAttempted,
+		arg.LastError,
+		arg.ID,
+		arg.ClaimToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getActivePaymentAttemptForReservation = `-- name: GetActivePaymentAttemptForReservation :one
+SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+FROM payment_attempts
+WHERE reservation_id = $1
+  AND status IN ('initializing', 'pending')
+LIMIT 1
+`
+
+func (q *Queries) GetActivePaymentAttemptForReservation(ctx context.Context, reservationID pgtype.UUID) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, getActivePaymentAttemptForReservation, reservationID)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
 
 const getPaymentAttemptByID = `-- name: GetPaymentAttemptByID :one
-SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
 FROM payment_attempts
 WHERE id = $1
 LIMIT 1
@@ -262,12 +617,17 @@ func (q *Queries) GetPaymentAttemptByID(ctx context.Context, id pgtype.UUID) (Pa
 		&i.CompletedAt,
 		&i.Provider,
 		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
 
 const getPaymentAttemptByProviderOrder = `-- name: GetPaymentAttemptByProviderOrder :one
-SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
 FROM payment_attempts
 WHERE provider = $1
   AND provider_order_reference = $2
@@ -294,6 +654,48 @@ func (q *Queries) GetPaymentAttemptByProviderOrder(ctx context.Context, arg GetP
 		&i.CompletedAt,
 		&i.Provider,
 		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
+	)
+	return i, err
+}
+
+const getPaymentAttemptByProviderSession = `-- name: GetPaymentAttemptByProviderSession :one
+SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+FROM payment_attempts
+WHERE provider = $1
+  AND provider_checkout_session_id = $2
+LIMIT 1
+`
+
+type GetPaymentAttemptByProviderSessionParams struct {
+	Provider                  string      `db:"provider" json:"provider"`
+	ProviderCheckoutSessionID pgtype.Text `db:"provider_checkout_session_id" json:"provider_checkout_session_id"`
+}
+
+func (q *Queries) GetPaymentAttemptByProviderSession(ctx context.Context, arg GetPaymentAttemptByProviderSessionParams) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, getPaymentAttemptByProviderSession, arg.Provider, arg.ProviderCheckoutSessionID)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
@@ -328,10 +730,43 @@ func (q *Queries) GetPaymentWebhookEvent(ctx context.Context, arg GetPaymentWebh
 	return i, err
 }
 
+const getRefundByID = `-- name: GetRefundByID :one
+SELECT id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error, idempotency_key
+FROM refunds
+WHERE id = $1
+LIMIT 1
+`
+
+func (q *Queries) GetRefundByID(ctx context.Context, id pgtype.UUID) (Refund, error) {
+	row := q.db.QueryRow(ctx, getRefundByID, id)
+	var i Refund
+	err := row.Scan(
+		&i.ID,
+		&i.BookingID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.CompletedAt,
+		&i.PaymentAttemptID,
+		&i.ProviderRefundReference,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.ClaimExpiresAt,
+		&i.LastAttemptAt,
+		&i.LastError,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
 const getRefundByPaymentAttemptID = `-- name: GetRefundByPaymentAttemptID :one
-SELECT id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error
+SELECT id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error, idempotency_key
 FROM refunds
 WHERE payment_attempt_id = $1
+ORDER BY created_at DESC, id DESC
 LIMIT 1
 `
 
@@ -355,12 +790,44 @@ func (q *Queries) GetRefundByPaymentAttemptID(ctx context.Context, paymentAttemp
 		&i.ClaimExpiresAt,
 		&i.LastAttemptAt,
 		&i.LastError,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
+const lockPaymentAttemptByID = `-- name: LockPaymentAttemptByID :one
+SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+FROM payment_attempts
+WHERE id = $1
+FOR UPDATE
+`
+
+func (q *Queries) LockPaymentAttemptByID(ctx context.Context, id pgtype.UUID) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, lockPaymentAttemptByID, id)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
 
 const lockPaymentAttemptByProviderOrder = `-- name: LockPaymentAttemptByProviderOrder :one
-SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+SELECT id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
 FROM payment_attempts
 WHERE provider = $1
   AND provider_order_reference = $2
@@ -387,6 +854,11 @@ func (q *Queries) LockPaymentAttemptByProviderOrder(ctx context.Context, arg Loc
 		&i.CompletedAt,
 		&i.Provider,
 		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
@@ -421,6 +893,119 @@ func (q *Queries) LockPaymentWebhookEvent(ctx context.Context, arg LockPaymentWe
 	return i, err
 }
 
+const reclaimPaymentAttemptInitLease = `-- name: ReclaimPaymentAttemptInitLease :one
+UPDATE payment_attempts
+SET
+    init_claim_token = $1,
+    init_lease_expires_at = clock_timestamp() + $2::interval
+WHERE id = $3
+  AND status = 'initializing'
+  AND init_lease_expires_at <= clock_timestamp()
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
+`
+
+type ReclaimPaymentAttemptInitLeaseParams struct {
+	InitClaimToken pgtype.UUID     `db:"init_claim_token" json:"init_claim_token"`
+	LeaseDuration  pgtype.Interval `db:"lease_duration" json:"lease_duration"`
+	ID             pgtype.UUID     `db:"id" json:"id"`
+}
+
+func (q *Queries) ReclaimPaymentAttemptInitLease(ctx context.Context, arg ReclaimPaymentAttemptInitLeaseParams) (PaymentAttempt, error) {
+	row := q.db.QueryRow(ctx, reclaimPaymentAttemptInitLease, arg.InitClaimToken, arg.LeaseDuration, arg.ID)
+	var i PaymentAttempt
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.ProviderReference,
+		&i.FailureReason,
+		&i.AttemptedAt,
+		&i.CompletedAt,
+		&i.Provider,
+		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
+	)
+	return i, err
+}
+
+const retryFailedRefund = `-- name: RetryFailedRefund :one
+UPDATE refunds
+SET
+    status = 'pending',
+    next_attempt_at = clock_timestamp(),
+    failure_reason = NULL,
+    last_error = NULL
+WHERE id = $1
+  AND status = 'failed'
+RETURNING id, booking_id, amount_minor, currency, status, failure_reason, created_at, completed_at, payment_attempt_id, provider_refund_reference, attempts, next_attempt_at, claim_token, claim_expires_at, last_attempt_at, last_error, idempotency_key
+`
+
+func (q *Queries) RetryFailedRefund(ctx context.Context, id pgtype.UUID) (Refund, error) {
+	row := q.db.QueryRow(ctx, retryFailedRefund, id)
+	var i Refund
+	err := row.Scan(
+		&i.ID,
+		&i.BookingID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Status,
+		&i.FailureReason,
+		&i.CreatedAt,
+		&i.CompletedAt,
+		&i.PaymentAttemptID,
+		&i.ProviderRefundReference,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.ClaimToken,
+		&i.ClaimExpiresAt,
+		&i.LastAttemptAt,
+		&i.LastError,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
+const retryRefund = `-- name: RetryRefund :execrows
+UPDATE refunds
+SET
+    status = 'pending',
+    next_attempt_at = $1,
+    attempts = attempts + 1,
+    last_attempt_at = clock_timestamp(),
+    last_error = $2,
+    claim_token = NULL,
+    claim_expires_at = NULL
+WHERE id = $3
+  AND status = 'processing'
+  AND claim_token = $4
+`
+
+type RetryRefundParams struct {
+	NextAttemptAt pgtype.Timestamptz `db:"next_attempt_at" json:"next_attempt_at"`
+	LastError     pgtype.Text        `db:"last_error" json:"last_error"`
+	ID            pgtype.UUID        `db:"id" json:"id"`
+	ClaimToken    pgtype.UUID        `db:"claim_token" json:"claim_token"`
+}
+
+func (q *Queries) RetryRefund(ctx context.Context, arg RetryRefundParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryRefund,
+		arg.NextAttemptAt,
+		arg.LastError,
+		arg.ID,
+		arg.ClaimToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const succeedPaymentAttempt = `-- name: SucceedPaymentAttempt :one
 UPDATE payment_attempts
 SET
@@ -428,8 +1013,8 @@ SET
     provider_reference = $1,
     completed_at = clock_timestamp()
 WHERE id = $2
-  AND status = 'pending'
-RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+  AND status IN ('pending', 'expired')
+RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference, provider_checkout_session_id, checkout_url, expires_at, init_claim_token, init_lease_expires_at
 `
 
 type SucceedPaymentAttemptParams struct {
@@ -452,40 +1037,31 @@ func (q *Queries) SucceedPaymentAttempt(ctx context.Context, arg SucceedPaymentA
 		&i.CompletedAt,
 		&i.Provider,
 		&i.ProviderOrderReference,
+		&i.ProviderCheckoutSessionID,
+		&i.CheckoutUrl,
+		&i.ExpiresAt,
+		&i.InitClaimToken,
+		&i.InitLeaseExpiresAt,
 	)
 	return i, err
 }
 
-const updatePaymentAttemptProviderOrder = `-- name: UpdatePaymentAttemptProviderOrder :one
-UPDATE payment_attempts
-SET
-    provider_order_reference = $1
-WHERE id = $2
-RETURNING id, reservation_id, amount_minor, currency, status, provider_reference, failure_reason, attempted_at, completed_at, provider, provider_order_reference
+const sumActiveRefundsForAttempt = `-- name: SumActiveRefundsForAttempt :one
+
+SELECT COALESCE(SUM(amount_minor), 0)::bigint AS total_amount_minor
+FROM refunds
+WHERE payment_attempt_id = $1
+  AND status IN ('pending', 'processing', 'succeeded')
 `
 
-type UpdatePaymentAttemptProviderOrderParams struct {
-	ProviderOrderReference pgtype.Text `db:"provider_order_reference" json:"provider_order_reference"`
-	ID                     pgtype.UUID `db:"id" json:"id"`
-}
-
-func (q *Queries) UpdatePaymentAttemptProviderOrder(ctx context.Context, arg UpdatePaymentAttemptProviderOrderParams) (PaymentAttempt, error) {
-	row := q.db.QueryRow(ctx, updatePaymentAttemptProviderOrder, arg.ProviderOrderReference, arg.ID)
-	var i PaymentAttempt
-	err := row.Scan(
-		&i.ID,
-		&i.ReservationID,
-		&i.AmountMinor,
-		&i.Currency,
-		&i.Status,
-		&i.ProviderReference,
-		&i.FailureReason,
-		&i.AttemptedAt,
-		&i.CompletedAt,
-		&i.Provider,
-		&i.ProviderOrderReference,
-	)
-	return i, err
+// ============================================================
+// REFUNDS
+// ============================================================
+func (q *Queries) SumActiveRefundsForAttempt(ctx context.Context, paymentAttemptID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, sumActiveRefundsForAttempt, paymentAttemptID)
+	var total_amount_minor int64
+	err := row.Scan(&total_amount_minor)
+	return total_amount_minor, err
 }
 
 const updatePaymentWebhookEventStatus = `-- name: UpdatePaymentWebhookEventStatus :one
@@ -494,7 +1070,7 @@ SET
     payment_attempt_id = COALESCE($1, payment_attempt_id),
     processing_status = $2,
     processed_at = CASE
-        WHEN $2 = 'processed' THEN clock_timestamp()
+        WHEN $2 IN ('processed', 'ignored') THEN clock_timestamp()
         ELSE NULL
     END
 WHERE id = $3

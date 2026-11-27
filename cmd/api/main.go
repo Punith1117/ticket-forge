@@ -208,7 +208,7 @@ func main() {
 	// Simulated hosted checkout routes (strictly disabled in production)
 	isDevMode := os.Getenv("ENV") != "production"
 	if isDevMode && payCfg.Provider == "simulated" {
-		simProvider.SetReservationChecker(&reservationCheckerAdapter{pool: pool})
+		simProvider.SetSessionLookup(&sessionLookupAdapter{pool: pool, provider: simProvider.Name()})
 		simProvider.RegisterRoutes(mux)
 		logger.Info("Simulated payment hosted checkout enabled", "provider", payCfg.Provider)
 	}
@@ -259,21 +259,43 @@ func main() {
 	logger.Info("TicketForge API server stopped successfully")
 }
 
-type reservationCheckerAdapter struct {
-	pool *pgxpool.Pool
+type sessionLookupAdapter struct {
+	pool     *pgxpool.Pool
+	provider string
 }
 
-func (a *reservationCheckerAdapter) GetReservationStatus(ctx context.Context, reservationID string) (simulator.ReservationStatus, error) {
-	u, err := uuid.Parse(reservationID)
+func (a *sessionLookupAdapter) GetSessionBySessionID(ctx context.Context, sessionID string) (simulator.PersistedSession, error) {
+	attempt, err := sqlc.New(a.pool).GetPaymentAttemptByProviderSession(ctx, sqlc.GetPaymentAttemptByProviderSessionParams{
+		Provider:                   a.provider,
+		ProviderCheckoutSessionID: pgtype.Text{String: sessionID, Valid: true},
+	})
 	if err != nil {
-		return simulator.ReservationStatus{}, err
+		return simulator.PersistedSession{}, err
 	}
-	res, err := sqlc.New(a.pool).GetReservationByID(ctx, pgtype.UUID{Bytes: u, Valid: true})
+	return toPersistedSession(attempt), nil
+}
+
+func (a *sessionLookupAdapter) GetSessionByAttemptID(ctx context.Context, attemptID string) (simulator.PersistedSession, error) {
+	u, err := uuid.Parse(attemptID)
 	if err != nil {
-		return simulator.ReservationStatus{}, err
+		return simulator.PersistedSession{}, err
 	}
-	return simulator.ReservationStatus{
-		Status:    res.Status,
-		ExpiresAt: res.ExpiresAt.Time,
-	}, nil
+	attempt, err := sqlc.New(a.pool).GetPaymentAttemptByID(ctx, pgtype.UUID{Bytes: u, Valid: true})
+	if err != nil {
+		return simulator.PersistedSession{}, err
+	}
+	return toPersistedSession(attempt), nil
+}
+
+func toPersistedSession(attempt sqlc.PaymentAttempt) simulator.PersistedSession {
+	return simulator.PersistedSession{
+		PaymentAttemptID: uuid.UUID(attempt.ID.Bytes).String(),
+		SessionID:        attempt.ProviderCheckoutSessionID.String,
+		OrderRef:         attempt.ProviderOrderReference.String,
+		ReservationID:    uuid.UUID(attempt.ReservationID.Bytes).String(),
+		AmountMinor:      attempt.AmountMinor,
+		Currency:         attempt.Currency,
+		Status:           attempt.Status,
+		ExpiresAt:        attempt.ExpiresAt.Time,
+	}
 }

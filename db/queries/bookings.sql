@@ -6,6 +6,7 @@
 INSERT INTO bookings (
     id,
     reservation_id,
+    payment_attempt_id,
     customer_id,
     quantity,
     unit_price_minor,
@@ -16,6 +17,7 @@ INSERT INTO bookings (
 ) VALUES (
     @id,
     @reservation_id,
+    @payment_attempt_id,
     @customer_id,
     @quantity,
     @unit_price_minor,

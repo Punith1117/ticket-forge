@@ -23,6 +23,7 @@ import (
 	"github.com/Punith1117/ticket-forge/internal/payment"
 	"github.com/Punith1117/ticket-forge/internal/payment/simulator"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -337,12 +338,21 @@ func TestCheckoutSession_MultipleSessionsForSameReservation(t *testing.T) {
 		t.Fatalf("failed to create session 3: %v", err)
 	}
 
-	// Ensure all have distinct attempt IDs and provider session/order references
-	if s1.PaymentAttemptID == s2.PaymentAttemptID || s2.PaymentAttemptID == s3.PaymentAttemptID {
-		t.Errorf("expected distinct payment attempt IDs: %s, %s, %s", s1.PaymentAttemptID, s2.PaymentAttemptID, s3.PaymentAttemptID)
+	// Ensure all return the exact same reused payment attempt and provider session
+	if s1.Reused {
+		t.Errorf("expected first session Reused=false")
 	}
-	if s1.ProviderSessionID == s2.ProviderSessionID || s2.ProviderSessionID == s3.ProviderSessionID {
-		t.Errorf("expected distinct provider session IDs: %s, %s, %s", s1.ProviderSessionID, s2.ProviderSessionID, s3.ProviderSessionID)
+	if !s2.Reused || !s3.Reused {
+		t.Errorf("expected subsequent sessions Reused=true, got s2=%v s3=%v", s2.Reused, s3.Reused)
+	}
+	if s1.PaymentAttemptID != s2.PaymentAttemptID || s2.PaymentAttemptID != s3.PaymentAttemptID {
+		t.Errorf("expected identical payment attempt IDs: %s, %s, %s", s1.PaymentAttemptID, s2.PaymentAttemptID, s3.PaymentAttemptID)
+	}
+	if s1.ProviderSessionID != s2.ProviderSessionID || s2.ProviderSessionID != s3.ProviderSessionID {
+		t.Errorf("expected identical provider session IDs: %s, %s, %s", s1.ProviderSessionID, s2.ProviderSessionID, s3.ProviderSessionID)
+	}
+	if s1.CheckoutURL != s2.CheckoutURL || s2.CheckoutURL != s3.CheckoutURL {
+		t.Errorf("expected identical checkout URLs: %s, %s, %s", s1.CheckoutURL, s2.CheckoutURL, s3.CheckoutURL)
 	}
 
 	// Verify original reservation expiration is preserved and NOT extended
@@ -969,7 +979,7 @@ func TestHostedCheckout_ExpiredReservationRejected(t *testing.T) {
 	f.simulator.SetWebhookURL(server.URL + "/api/v1/webhooks/payment")
 	f.simulator.SetBaseURL(server.URL)
 
-	// Attempt to complete — reservation checker should reject it
+	// Simulator delivers the webhook; settlement records late payment and enqueues a refund
 	reqBody := strings.NewReader(`{"outcome":"succeeded"}`)
 	resp, err := http.Post(
 		server.URL+"/api/v1/checkout/"+checkoutResp.ProviderSessionID+"/complete",
@@ -981,17 +991,28 @@ func TestHostedCheckout_ExpiredReservationRejected(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("expected 409 for expired reservation, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for late completion webhook delivery, got %d", resp.StatusCode)
 	}
 
-	// Verify payment attempt remains pending (no webhook was delivered)
+	// Verify payment attempt is recorded as succeeded (not discarded)
 	attempt, err := f.paymentService.GetPaymentAttemptByID(ctx, checkoutResp.PaymentAttemptID)
 	if err != nil {
 		t.Fatalf("failed to query attempt: %v", err)
 	}
-	if attempt.Status != "pending" {
-		t.Errorf("expected status to remain pending, got %s", attempt.Status)
+	if attempt.Status != "succeeded" {
+		t.Errorf("expected status succeeded, got %s", attempt.Status)
+	}
+
+	// Verify no booking created and 1 pending refund created
+	var bookingCount, refundCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM refunds WHERE payment_attempt_id = $1 AND status = 'pending'`, checkoutResp.PaymentAttemptID).Scan(&refundCount)
+	if bookingCount != 0 {
+		t.Errorf("expected 0 bookings for expired reservation, got %d", bookingCount)
+	}
+	if refundCount != 1 {
+		t.Errorf("expected 1 pending refund for late payment, got %d", refundCount)
 	}
 }
 
@@ -1387,20 +1408,26 @@ func TestPaymentConfirmation_MultipleAttemptsSameReservation(t *testing.T) {
 
 	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
 
-	// Create two distinct checkout sessions for the same reservation
+	// Create session 1, then expire it locally so session 2 can be created
 	sess1, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
 	if err != nil {
 		t.Fatalf("session 1 failed: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE payment_attempts SET status = 'expired', completed_at = now() WHERE id = $1`, sess1.PaymentAttemptID); err != nil {
+		t.Fatalf("expire attempt 1 failed: %v", err)
 	}
 	sess2, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
 	if err != nil {
 		t.Fatalf("session 2 failed: %v", err)
 	}
+	if sess1.PaymentAttemptID == sess2.PaymentAttemptID {
+		t.Fatalf("expected distinct attempt after expiry")
+	}
 
 	att1, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess1.PaymentAttemptID)
 	att2, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess2.PaymentAttemptID)
 
-	// Attempt 1 succeeds and confirms the reservation
+	// Attempt 1 (currently expired) succeeds first via late webhook and confirms the reservation
 	err = f.paymentService.ProcessWebhookEvent(ctx, payment.WebhookEvent{
 		EventID:                  "evt_att1_" + uuid.NewString(),
 		Provider:                 simulator.ProviderName,
@@ -1416,11 +1443,15 @@ func TestPaymentConfirmation_MultipleAttemptsSameReservation(t *testing.T) {
 		t.Fatalf("attempt 1 webhook failed: %v", err)
 	}
 
-	// Reservation confirmed and 1 booking created
+	// Reservation confirmed and 1 booking created linked to attempt 1
 	var bookingCount int
-	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount)
+	var bookingAttemptID string
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(MAX(payment_attempt_id::text), '') FROM bookings WHERE reservation_id = $1`, res.ID).Scan(&bookingCount, &bookingAttemptID)
 	if bookingCount != 1 {
 		t.Fatalf("expected 1 booking, got %d", bookingCount)
+	}
+	if bookingAttemptID != sess1.PaymentAttemptID {
+		t.Fatalf("expected booking.payment_attempt_id=%s, got %s", sess1.PaymentAttemptID, bookingAttemptID)
 	}
 
 	// Attempt 2 succeeds later (customer accidentally paid twice or delayed provider callback)
@@ -1523,5 +1554,245 @@ func TestPaymentConfirmation_ConcurrentWebhooks(t *testing.T) {
 	_ = f.pool.QueryRow(ctx, `SELECT reserved_quantity, sold_quantity FROM inventory WHERE ticket_category_id = $1`, res.TicketCategoryID).Scan(&reservedQty, &soldQty)
 	if reservedQty != 0 || soldQty != 2 {
 		t.Errorf("expected reserved=0, sold=2, got reserved=%d, sold=%d", reservedQty, soldQty)
+	}
+}
+
+func TestCheckoutSession_ConcurrentInitiation(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
+
+	const workers = 10
+	var wg sync.WaitGroup
+	results := make([]payment.CheckoutSessionResponse, workers)
+	errs := make([]error, workers)
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx], errs[idx] = f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+		}(i)
+	}
+	wg.Wait()
+
+	var attemptIDs = make(map[string]bool)
+	for i := 0; i < workers; i++ {
+		if errs[i] != nil && !errors.Is(errs[i], payment.ErrCheckoutInProgress) {
+			t.Fatalf("worker %d unexpected error: %v", i, errs[i])
+		}
+		if errs[i] == nil {
+			attemptIDs[results[i].PaymentAttemptID] = true
+		}
+	}
+
+	if len(attemptIDs) != 1 {
+		t.Errorf("expected exactly 1 payment_attempt_id across concurrent calls, got %d (%v)", len(attemptIDs), attemptIDs)
+	}
+
+	var dbCount int
+	_ = f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM payment_attempts WHERE reservation_id = $1`, res.ID).Scan(&dbCount)
+	if dbCount != 1 {
+		t.Errorf("expected 1 payment_attempts row in DB, got %d", dbCount)
+	}
+}
+
+func TestCheckoutSession_InitializingLeaseLifecycle(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
+
+	// 1. Insert an active initializing attempt -> CreateCheckoutSession must return ErrCheckoutInProgress
+	attemptID := uuid.New()
+	claimToken := uuid.New()
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO payment_attempts (id, reservation_id, amount_minor, currency, status, provider, init_claim_token, init_lease_expires_at)
+		VALUES ($1, $2, $3, $4, 'initializing', $5, $6, now() + interval '30 seconds')
+	`, attemptID, res.ID, res.TotalPriceMinor, res.Currency, simulator.ProviderName, claimToken)
+	if err != nil {
+		t.Fatalf("failed to insert active initializing attempt: %v", err)
+	}
+
+	_, err = f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if !errors.Is(err, payment.ErrCheckoutInProgress) {
+		t.Fatalf("expected ErrCheckoutInProgress for active lease, got %v", err)
+	}
+
+	// 2. Expire the initialization lease -> CreateCheckoutSession reclaims lease & reconciles same attemptID
+	_, err = f.pool.Exec(ctx, `
+		UPDATE payment_attempts SET init_lease_expires_at = now() - interval '5 seconds' WHERE id = $1
+	`, attemptID)
+	if err != nil {
+		t.Fatalf("failed to expire init lease: %v", err)
+	}
+
+	resp, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("expected lease recovery to succeed, got %v", err)
+	}
+	if resp.PaymentAttemptID != attemptID.String() {
+		t.Errorf("expected reconciled attemptID %s, got %s", attemptID.String(), resp.PaymentAttemptID)
+	}
+	if resp.Status != "pending" {
+		t.Errorf("expected pending status after reconciliation, got %s", resp.Status)
+	}
+	if !resp.Reused {
+		t.Errorf("expected Reused=true for reconciled attempt")
+	}
+}
+
+func TestRefundWorker_ProcessesAndRetries(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
+	sess, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("create checkout failed: %v", err)
+	}
+
+	// Force-expire reservation so payment triggers auto-refund
+	_, _ = f.pool.Exec(ctx, `UPDATE reservations SET status = 'expired', expires_at = now() - interval '10 seconds' WHERE id = $1`, res.ID)
+	att, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess.PaymentAttemptID)
+
+	err = f.paymentService.ProcessWebhookEvent(ctx, payment.WebhookEvent{
+		EventID:                  "evt_late_refund_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   att.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_late_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("late webhook failed: %v", err)
+	}
+
+	// Simulate transient error on first refund attempt, then succeed on second
+	callCount := 0
+	f.simulator.SetRefundHook(func(ctx context.Context, req payment.RefundRequest) (payment.RefundResult, error) {
+		callCount++
+		if callCount == 1 {
+			return payment.RefundResult{}, errors.New("temporary gateway timeout")
+		}
+		return payment.RefundResult{ProviderRefundReference: "sim_ref_" + req.RefundID}, nil
+	})
+	defer f.simulator.SetRefundHook(nil)
+
+	repo, _ := payment.NewRepository(f.pool)
+	worker, err := payment.NewRefundWorker(repo, f.simulator, payment.RefundWorkerConfig{
+		PollInterval:   50 * time.Millisecond,
+		BatchSize:      10,
+		LeaseDuration:  30 * time.Second,
+		BaseRetryDelay: 10 * time.Millisecond,
+		MaxRetryDelay:  100 * time.Millisecond,
+		MaxRetries:     3,
+	}, nil)
+	if err != nil {
+		t.Fatalf("new refund worker failed: %v", err)
+	}
+
+	// Batch 1: transient failure -> status returns to pending with attempts=1
+	n, err := worker.ProcessNextBatch(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("expected 1 refund claimed in batch 1, got n=%d err=%v", n, err)
+	}
+
+	var status string
+	var attempts int32
+	_ = f.pool.QueryRow(ctx, `SELECT status, attempts FROM refunds WHERE payment_attempt_id = $1`, sess.PaymentAttemptID).Scan(&status, &attempts)
+	if status != "pending" || attempts != 1 {
+		t.Fatalf("expected pending with attempts=1 after transient error, got status=%s attempts=%d", status, attempts)
+	}
+
+	// Wait for backoff and run Batch 2 -> succeeds
+	time.Sleep(30 * time.Millisecond)
+	n, err = worker.ProcessNextBatch(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("expected 1 refund claimed in batch 2, got n=%d err=%v", n, err)
+	}
+
+	_ = f.pool.QueryRow(ctx, `SELECT status FROM refunds WHERE payment_attempt_id = $1`, sess.PaymentAttemptID).Scan(&status)
+	if status != "succeeded" {
+		t.Fatalf("expected refund status succeeded, got %s", status)
+	}
+
+	// Verify payment attempt remains succeeded
+	attAfter, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess.PaymentAttemptID)
+	if attAfter.Status != "succeeded" {
+		t.Errorf("expected payment attempt to remain succeeded after refund, got %s", attAfter.Status)
+	}
+}
+
+func TestRefund_OverRefundPreventedConcurrently(t *testing.T) {
+	f := setupPaymentIntegrationDB(t)
+	ctx := context.Background()
+
+	res := createTestHeldReservation(t, ctx, f, f.categoryID, 1)
+	sess, err := f.paymentService.CreateCheckoutSession(ctx, f.customerID, res.ID)
+	if err != nil {
+		t.Fatalf("create checkout failed: %v", err)
+	}
+	att, _ := f.paymentService.GetPaymentAttemptByID(ctx, sess.PaymentAttemptID)
+
+	err = f.paymentService.ProcessWebhookEvent(ctx, payment.WebhookEvent{
+		EventID:                  "evt_over_" + uuid.NewString(),
+		Provider:                 simulator.ProviderName,
+		ProviderOrderReference:   att.ProviderOrderReference.String,
+		ProviderPaymentReference: "pay_over_" + uuid.NewString(),
+		Outcome:                  payment.PaymentOutcomeSucceeded,
+		EventType:                "payment.succeeded",
+		AmountMinor:              res.TotalPriceMinor,
+		Currency:                 res.Currency,
+		RawPayload:               []byte(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("webhook failed: %v", err)
+	}
+
+	attemptUUID := uuid.MustParse(sess.PaymentAttemptID)
+	attemptDBID := pgtype.UUID{Bytes: attemptUUID, Valid: true}
+
+	// Two concurrent partial refunds each requesting 60% of the total amount: only 1 may succeed
+	partialAmount := (res.TotalPriceMinor * 6) / 10
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			tx, txErr := f.pool.Begin(ctx)
+			if txErr != nil {
+				errs[idx] = txErr
+				return
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			_, rErr := f.paymentService.CreateRefundTx(ctx, tx, attemptDBID, pgtype.UUID{Valid: false}, partialAmount, "")
+			if rErr != nil {
+				errs[idx] = rErr
+				return
+			}
+			errs[idx] = tx.Commit(ctx)
+		}(i)
+	}
+	wg.Wait()
+
+	var successes, overRefunds int
+	for _, e := range errs {
+		if e == nil {
+			successes++
+		} else if errors.Is(e, payment.ErrOverRefund) {
+			overRefunds++
+		} else {
+			t.Fatalf("unexpected error: %v", e)
+		}
+	}
+
+	if successes != 1 || overRefunds != 1 {
+		t.Errorf("expected 1 success and 1 ErrOverRefund, got successes=%d overRefunds=%d", successes, overRefunds)
 	}
 }

@@ -9,16 +9,17 @@ import (
 )
 
 type Booking struct {
-	ID              pgtype.UUID        `db:"id" json:"id"`
-	ReservationID   pgtype.UUID        `db:"reservation_id" json:"reservation_id"`
-	CustomerID      pgtype.UUID        `db:"customer_id" json:"customer_id"`
-	Quantity        int32              `db:"quantity" json:"quantity"`
-	UnitPriceMinor  int64              `db:"unit_price_minor" json:"unit_price_minor"`
-	TotalPriceMinor int64              `db:"total_price_minor" json:"total_price_minor"`
-	Currency        string             `db:"currency" json:"currency"`
-	Status          string             `db:"status" json:"status"`
-	ConfirmedAt     pgtype.Timestamptz `db:"confirmed_at" json:"confirmed_at"`
-	CreatedAt       pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	ID               pgtype.UUID        `db:"id" json:"id"`
+	ReservationID    pgtype.UUID        `db:"reservation_id" json:"reservation_id"`
+	CustomerID       pgtype.UUID        `db:"customer_id" json:"customer_id"`
+	Quantity         int32              `db:"quantity" json:"quantity"`
+	UnitPriceMinor   int64              `db:"unit_price_minor" json:"unit_price_minor"`
+	TotalPriceMinor  int64              `db:"total_price_minor" json:"total_price_minor"`
+	Currency         string             `db:"currency" json:"currency"`
+	Status           string             `db:"status" json:"status"`
+	ConfirmedAt      pgtype.Timestamptz `db:"confirmed_at" json:"confirmed_at"`
+	CreatedAt        pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	PaymentAttemptID pgtype.UUID        `db:"payment_attempt_id" json:"payment_attempt_id"`
 }
 
 type Event struct {
@@ -90,17 +91,22 @@ type PasswordResetToken struct {
 }
 
 type PaymentAttempt struct {
-	ID                     pgtype.UUID        `db:"id" json:"id"`
-	ReservationID          pgtype.UUID        `db:"reservation_id" json:"reservation_id"`
-	AmountMinor            int64              `db:"amount_minor" json:"amount_minor"`
-	Currency               string             `db:"currency" json:"currency"`
-	Status                 string             `db:"status" json:"status"`
-	ProviderReference      pgtype.Text        `db:"provider_reference" json:"provider_reference"`
-	FailureReason          pgtype.Text        `db:"failure_reason" json:"failure_reason"`
-	AttemptedAt            pgtype.Timestamptz `db:"attempted_at" json:"attempted_at"`
-	CompletedAt            pgtype.Timestamptz `db:"completed_at" json:"completed_at"`
-	Provider               string             `db:"provider" json:"provider"`
-	ProviderOrderReference pgtype.Text        `db:"provider_order_reference" json:"provider_order_reference"`
+	ID                        pgtype.UUID        `db:"id" json:"id"`
+	ReservationID             pgtype.UUID        `db:"reservation_id" json:"reservation_id"`
+	AmountMinor               int64              `db:"amount_minor" json:"amount_minor"`
+	Currency                  string             `db:"currency" json:"currency"`
+	Status                    string             `db:"status" json:"status"`
+	ProviderReference         pgtype.Text        `db:"provider_reference" json:"provider_reference"`
+	FailureReason             pgtype.Text        `db:"failure_reason" json:"failure_reason"`
+	AttemptedAt               pgtype.Timestamptz `db:"attempted_at" json:"attempted_at"`
+	CompletedAt               pgtype.Timestamptz `db:"completed_at" json:"completed_at"`
+	Provider                  string             `db:"provider" json:"provider"`
+	ProviderOrderReference    pgtype.Text        `db:"provider_order_reference" json:"provider_order_reference"`
+	ProviderCheckoutSessionID pgtype.Text        `db:"provider_checkout_session_id" json:"provider_checkout_session_id"`
+	CheckoutUrl               pgtype.Text        `db:"checkout_url" json:"checkout_url"`
+	ExpiresAt                 pgtype.Timestamptz `db:"expires_at" json:"expires_at"`
+	InitClaimToken            pgtype.UUID        `db:"init_claim_token" json:"init_claim_token"`
+	InitLeaseExpiresAt        pgtype.Timestamptz `db:"init_lease_expires_at" json:"init_lease_expires_at"`
 }
 
 type PaymentWebhookEvent struct {
@@ -139,6 +145,7 @@ type Refund struct {
 	ClaimExpiresAt          pgtype.Timestamptz `db:"claim_expires_at" json:"claim_expires_at"`
 	LastAttemptAt           pgtype.Timestamptz `db:"last_attempt_at" json:"last_attempt_at"`
 	LastError               pgtype.Text        `db:"last_error" json:"last_error"`
+	IdempotencyKey          string             `db:"idempotency_key" json:"idempotency_key"`
 }
 
 type RegistrationVerificationChallenge struct {

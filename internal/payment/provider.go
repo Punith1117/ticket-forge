@@ -45,9 +45,26 @@ type WebhookEvent struct {
 	RawPayload               []byte
 }
 
+// RefundRequest holds normalized data to execute a refund with the provider.
+type RefundRequest struct {
+	RefundID                 string
+	PaymentAttemptID         string
+	ProviderPaymentReference string
+	ProviderOrderReference   string
+	AmountMinor              int64
+	Currency                 string
+	Reason                   string
+}
+
+// RefundResult contains the provider's response for a refund execution.
+type RefundResult struct {
+	ProviderRefundReference string
+}
+
 // Provider represents the capabilities required from an external payment provider.
 type Provider interface {
 	Name() string
 	CreateCheckoutSession(ctx context.Context, req CreateCheckoutSessionRequest) (CheckoutSession, error)
 	VerifyWebhook(payload []byte, headers http.Header) (WebhookEvent, error)
+	Refund(ctx context.Context, req RefundRequest) (RefundResult, error)
 }
