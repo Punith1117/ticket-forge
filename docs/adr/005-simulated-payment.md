@@ -1,7 +1,7 @@
 # ADR-005: Use a Simulated Payment Provider in the Initial Release
 
 - Status: Accepted
-- Date: 2026-11-22
+- Date: 2026-11-27
 
 ## Context
 
@@ -35,17 +35,23 @@ The following architectural principles will govern the implementation:
 
 4. **Reservation lifecycle independence:** Creating a checkout session will not extend, reset, or otherwise modify the reservation's expiration deadline. Payment attempts and reservation holds have separate lifecycles.
 
-5. **Multiple payment attempts:** A customer may initiate multiple payment attempts for the same reservation while the reservation remains eligible for checkout. Each attempt is independently identifiable and must be handled idempotently.
+5. **Checkout session reuse and single active attempt:** A reservation may have multiple historical payment attempts, but it must have at most one active, potentially payable checkout session at a time (`initializing` or `pending`). Calling the checkout initiation endpoint while a pending session exists returns the existing session rather than creating duplicate payable sessions. A new attempt is only permitted once the previous attempt is definitively `failed` or `expired`.
 
-6. **No real money movement:** The simulated provider will not initiate actual financial transactions. Its purpose is to exercise the application's payment integration and lifecycle handling.
+6. **Durable session initialization and recovery:** Checkout session creation uses a durable `initializing` state with claim tokens and lease expirations. Abandoned or ambiguous initialization attempts are never expired solely by timeout; they are recovered and reconciled with the provider using the payment attempt ID as the idempotency key.
 
-7. **Separation of payment and booking confirmation:** Recording a successful payment outcome and confirming a booking are distinct operations. Payment success alone must not implicitly bypass the reservation's eligibility checks or inventory consistency requirements.
+7. **No real money movement:** The simulated provider will not initiate actual financial transactions. Its purpose is to exercise the application's payment integration and lifecycle handling.
+
+8. **Separation of payment and booking confirmation:** Recording a successful payment outcome and confirming a booking are distinct operations. Payment success alone must not implicitly bypass the reservation's eligibility checks or inventory consistency requirements. Confirmed bookings explicitly record the settling `payment_attempt_id`.
+
+9. **Late payment reconciliation and automatic refunds:** A verified payment success notification for an expired, cancelled, or otherwise ineligible reservation must still record the payment collection as `succeeded` (including `expired -> succeeded` reconciliation). It must not confirm the reservation or create a booking; instead, it automatically triggers an idempotent refund against that successful payment.
+
+10. **Refund lifecycle, retry, and over-refund prevention:** Refunds are associated with a payment attempt rather than strictly one-per-booking, supporting multiple partial refunds or late-payment refunds without a booking. The invariant `SUM(successful and pending refunds) <= collected amount` is enforced transactionally. Asynchronous refund processing supports worker lease claiming (`FOR UPDATE SKIP LOCKED`), retry with backoff, and terminal state tracking without altering the payment attempt's `succeeded` status.
 
 ## Scope
 
-The initial simulated-payment implementation will establish the provider abstraction, checkout-session creation, asynchronous payment outcome delivery, and idempotent webhook processing.
+The simulated-payment implementation establishes the provider abstraction, checkout-session creation and reuse, asynchronous payment outcome delivery, idempotent webhook processing, late-payment reconciliation, and asynchronous refund handling.
 
-Actual payment gateway integration, financial reconciliation, refunds, and the complete payment-to-booking confirmation workflow will be addressed in subsequent implementation milestones.
+Production payment gateway integrations with real external financial institutions will be introduced in subsequent milestones using additional provider adapters conforming to this architecture.
 
 ## Alternatives Considered
 
